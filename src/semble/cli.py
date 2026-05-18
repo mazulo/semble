@@ -8,7 +8,8 @@ from pathlib import Path
 from model2vec.utils import get_package_extras
 
 from semble.index import SembleIndex
-from semble.stats import format_savings_report
+from semble.stats import format_savings_report, invocation_source
+from semble.types import InvocationSource
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
 
 _CLAUDE_FILE_PATH = Path(".claude") / "agents" / "semble-search.md"
@@ -62,6 +63,7 @@ def _run_init(*, force: bool = False) -> None:
 
 
 def _cli_main() -> None:
+    invocation_source.set(InvocationSource.CLI)
     parser = argparse.ArgumentParser(prog="semble")
     sub = parser.add_subparsers(dest="command")
 

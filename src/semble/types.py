@@ -24,6 +24,13 @@ class CallType(str, Enum):
     FIND_RELATED = "find_related"
 
 
+class InvocationSource(str, Enum):
+    """How semble was invoked — used for token-savings tracking."""
+
+    CLI = "cli"
+    MCP = "mcp"
+
+
 class Encoder(Protocol):
     """Protocol for embedding models."""
 

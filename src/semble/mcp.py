@@ -12,7 +12,8 @@ from pydantic import Field
 
 from semble.index import SembleIndex
 from semble.index.dense import load_model
-from semble.types import Encoder
+from semble.stats import invocation_source
+from semble.types import Encoder, InvocationSource
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         Pass a git URL or local path as `repo` to index it on demand; indexes are cached for the session.
         Use this to find where something is implemented, understand a library, or locate related code.
         """
+        invocation_source.set(InvocationSource.MCP)
         try:
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
@@ -98,6 +100,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         Use after `search` to explore related implementations or callers.
         Pass file_path and line from a prior search result.
         """
+        invocation_source.set(InvocationSource.MCP)
         try:
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:

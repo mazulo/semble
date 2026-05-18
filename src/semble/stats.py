@@ -1,15 +1,18 @@
 import json
 import logging
 from collections import defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from semble.types import CallType, SearchResult
+from semble.types import CallType, InvocationSource, SearchResult
 
 logger = logging.getLogger(__name__)
 
 _STATS_FILE = Path.home() / ".semble" / "savings.jsonl"
+
+invocation_source: ContextVar[InvocationSource] = ContextVar("invocation_source")
 
 
 @dataclass
@@ -31,6 +34,7 @@ class BucketStats:
 class SavingsSummary:
     buckets: dict[str, BucketStats]
     call_type_counts: dict[str, int]
+    source_counts: dict[str, int]
 
 
 def save_search_stats(
@@ -48,6 +52,7 @@ def save_search_stats(
         record = {
             "ts": datetime.now(timezone.utc).timestamp(),
             "call": call_type,
+            "source": invocation_source.get(None),
             "results": len(results),
             "snippet_chars": snippet_chars,
             "file_chars": file_chars,
@@ -71,6 +76,7 @@ def build_savings_summary(path: Path = _STATS_FILE) -> SavingsSummary:
         "All time": BucketStats(),
     }
     call_type_counts: defaultdict[str, int] = defaultdict(int)
+    source_counts: defaultdict[str, int] = defaultdict(int)
 
     with path.open() as f:
         for line in f:
@@ -83,6 +89,8 @@ def build_savings_summary(path: Path = _STATS_FILE) -> SavingsSummary:
             file_chars = record["file_chars"]
             call_type = record["call"]
             call_type_counts[call_type] += 1
+            if source := record.get("source"):
+                source_counts[source] += 1
             dt = datetime.fromtimestamp(record["ts"], tz=timezone.utc)
             in_today = dt.date() == today
             in_last_7 = dt.date() > seven_days_ago
@@ -92,10 +100,10 @@ def build_savings_summary(path: Path = _STATS_FILE) -> SavingsSummary:
             if in_today:
                 buckets["Today"].add(snippet_chars, file_chars)
 
-    return SavingsSummary(buckets=buckets, call_type_counts=dict(call_type_counts))
+    return SavingsSummary(buckets=buckets, call_type_counts=dict(call_type_counts), source_counts=dict(source_counts))
 
 
-def format_savings_report(path: Path | None = None, *, verbose: bool = False) -> str:
+def format_savings_report(path: Path | None = None, *, verbose: bool = False) -> str:  # noqa: C901
     """Return a formatted token-savings report."""
     if path is None:
         path = _STATS_FILE
@@ -131,11 +139,16 @@ def format_savings_report(path: Path | None = None, *, verbose: bool = False) ->
             lines.append(f"  {label:<12}  {calls_str:<6}  [{bar}]  {saved_str} tokens ({pct}%)")
         else:
             lines.append(f"  {label:<12}  {calls_str:<6}  [{'░' * bar_width}]  {saved_str} tokens")
-    if verbose and summary.call_type_counts:
+    if verbose and (summary.call_type_counts or summary.source_counts):
         lines += ["", "  Usage Breakdown", light_line, f"  {'Call type':<16}  Calls"]
         for call_type, count in sorted(summary.call_type_counts.items()):
             count_str = f"{count / 1000:.1f}k" if count >= 1000 else str(count)
             lines.append(f"  {call_type:<16}  {count_str}")
+        if summary.source_counts:
+            lines += ["", f"  {'Invocation':<16}  Calls"]
+            for source, count in sorted(summary.source_counts.items()):
+                count_str = f"{count / 1000:.1f}k" if count >= 1000 else str(count)
+                lines.append(f"  {source:<16}  {count_str}")
         lines.append(heavy_line)
     lines.append("")
     return "\n".join(lines)
