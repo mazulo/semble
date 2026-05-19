@@ -5,7 +5,7 @@ from functools import cache
 from logging import getLogger
 
 from tree_sitter import Node, Parser
-from tree_sitter_language_pack import SupportedLanguage, get_parser
+from tree_sitter_language_pack import DownloadError, LanguageNotFoundError, SupportedLanguage, get_parser
 
 from semble.index.files import ALL_LANGUAGES
 
@@ -26,9 +26,17 @@ class ChunkBoundary:
 
 
 @cache
-def _cached_get_parser(language: SupportedLanguage) -> Parser:
+def _cached_get_parser(language: SupportedLanguage) -> Parser | None:
     """Gets a parser from tree_sitter."""
-    return get_parser(language)
+    try:
+        return get_parser(language)
+    except LanguageNotFoundError:
+        logger.warning("Language %s not found, falling back to line chunking", language)
+    except DownloadError:
+        logger.warning("Failed to download language %s, falling back to line chunking", language)
+    except Exception:
+        logger.error("Uncaught exception in _cached_get_parser", exc_info=True)
+    return None
 
 
 def _merge_adjacent_chunks(
@@ -121,13 +129,15 @@ def chunk_lines(text: str, desired_length: int) -> list[ChunkBoundary]:
     return _merge_adjacent_chunks(lines_as_groups, desired_length)
 
 
-def chunk(text: str, language: str, desired_length: int) -> list[ChunkBoundary]:
+def chunk(text: str, language: str, desired_length: int) -> list[ChunkBoundary] | None:
     """Chunk source code."""
     if not text.strip():
         return []
 
     as_bytes = text.encode("utf-8")
     parser = _cached_get_parser(language)
+    if parser is None:
+        return None
     root = parser.parse(as_bytes).root_node
 
     chunks = []
