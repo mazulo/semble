@@ -13,7 +13,7 @@ from bm25s import BM25
 
 from semble.index.create import create_index_from_path
 from semble.index.dense import SelectableBasicBackend, load_model
-from semble.search import search_bm25, search_hybrid, search_semantic
+from semble.search import Reranker, search_bm25, search_hybrid, search_semantic
 from semble.stats import save_search_stats
 from semble.types import CallType, Chunk, Encoder, IndexStats, SearchMode, SearchResult
 
@@ -46,6 +46,7 @@ class SembleIndex:
         self._root: Path | None = root
         self._file_sizes: dict[str, int] = self._compute_file_sizes(root) if root else {}
         self._file_mapping, self._language_mapping = self._populate_mapping()
+        self._chunk_to_idx: dict[Chunk, int] = {chunk: i for i, chunk in enumerate(chunks)}
 
     def _populate_mapping(self) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
         """Build (file → chunk indices, language → chunk indices) mappings, in that order."""
@@ -70,6 +71,16 @@ class SembleIndex:
             except OSError:
                 pass
         return sizes
+
+    @property
+    def chunk_index(self) -> dict[Chunk, int]:
+        """Mapping from each chunk to its position in :attr:`chunks`."""
+        return self._chunk_to_idx
+
+    @property
+    def embedding_matrix(self) -> npt.NDArray[np.float32]:
+        """Raw embedding matrix — row ``i`` is the embedding for ``chunks[i]``."""
+        return self._semantic_index._vectors  # type: ignore[return-value]
 
     @property
     def stats(self) -> IndexStats:
@@ -203,6 +214,10 @@ class SembleIndex:
         alpha: float | None = None,
         filter_languages: list[str] | None = None,
         filter_paths: list[str] | None = None,
+        reranker: Reranker | None = None,
+        semantic_filter: Reranker | None = None,
+        skip_file_boost: bool = False,
+        diversity: float | None = 0.1,
     ) -> list[SearchResult]:
         """Search the index and return the top-k most relevant chunks.
 
@@ -216,6 +231,10 @@ class SembleIndex:
             these languages are returned.
         :param filter_paths: Optional list of repo-relative file paths; if set, only
             chunks from these files are returned.
+        :param reranker: Optional callable replacing the default rerank_topk step (hybrid mode only).
+        :param semantic_filter: Optional callable applied to semantic candidates before RRF (hybrid mode only).
+        :param skip_file_boost: If True, skip the multi-chunk file boost step (hybrid mode only).
+        :param diversity: DPP post-ranking diversity weight in [0, 1]. Ignored for BM25 mode. Pass ``None`` to disable.
         :return: Ranked list of :class:`SearchResult` objects, best match first.
         :raises ValueError: If `mode` is not a recognised search strategy.
         """
@@ -224,16 +243,39 @@ class SembleIndex:
             return []
 
         selector = self._get_selector_vector(filter_languages, filter_paths)
+        chunk_index = self._chunk_to_idx if diversity is not None else None
 
         if mode == SearchMode.BM25:
             results = search_bm25(query, bm25_index, self.chunks, top_k, selector=selector)
         elif mode == SearchMode.SEMANTIC:
-            results = search_semantic(query, self.model, semantic_index, self.chunks, top_k, selector=selector)
+            results = search_semantic(
+                query,
+                self.model,
+                semantic_index,
+                self.chunks,
+                top_k,
+                selector=selector,
+                diversity=diversity,
+                chunk_index=chunk_index,
+            )
         elif mode == SearchMode.HYBRID:
             results = search_hybrid(
-                query, self.model, semantic_index, bm25_index, self.chunks, top_k, alpha=alpha, selector=selector
+                query,
+                self.model,
+                semantic_index,
+                bm25_index,
+                self.chunks,
+                top_k,
+                alpha=alpha,
+                selector=selector,
+                reranker=reranker,
+                semantic_filter=semantic_filter,
+                skip_file_boost=skip_file_boost,
+                diversity=diversity,
+                chunk_index=chunk_index,
             )
         else:
             raise ValueError(f"Unknown search mode: {mode!r}")
+
         save_search_stats(results, CallType.SEARCH, self._file_sizes)
         return results

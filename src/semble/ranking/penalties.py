@@ -1,7 +1,11 @@
 import re
 from pathlib import Path
 
-from semble.types import Chunk
+import numpy as np
+import numpy.typing as npt
+from pyversity import Strategy, diversify
+
+from semble.types import Chunk, SearchResult
 
 # Patterns that identify test files across common languages.
 # Grouped by language for readability; combined into a single compiled regex.
@@ -138,6 +142,33 @@ def rerank_topk(
 
     selected.sort(key=lambda t: -t[0])
     return [(chunk, score) for score, chunk in selected[:top_k]]
+
+
+def diversify_results(
+    results: list[SearchResult],
+    top_k: int,
+    diversity: float,
+    embedding_matrix: npt.NDArray[np.float32],
+    chunk_index: dict[Chunk, int],
+) -> list[SearchResult]:
+    """Re-rank results with DPP to improve embedding-space diversity.
+
+    :param results: Candidate results (should be top_k × _DPP_EXPAND).
+    :param top_k: Number of results to return.
+    :param diversity: DPP weight in [0, 1]; keep ≤ 0.3 to avoid hurting relevance.
+    :param embedding_matrix: From :attr:`SembleIndex.embedding_matrix`.
+    :param chunk_index: From :attr:`SembleIndex.chunk_index`.
+    :return: top_k results selected by DPP, sorted by original score descending.
+    """
+    valid = [r for r in results if r.chunk in chunk_index]
+    if len(valid) <= top_k:
+        return valid
+    indices = np.array([chunk_index[r.chunk] for r in valid])
+    scores = np.array([r.score for r in valid], dtype=np.float32)
+    selected = diversify(
+        embeddings=embedding_matrix[indices], scores=scores, k=top_k, strategy=Strategy.DPP, diversity=diversity
+    )
+    return sorted((valid[i] for i in selected.indices), key=lambda r: -r.score)
 
 
 def _file_path_penalty(file_path: str) -> float:

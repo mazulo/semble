@@ -1,12 +1,16 @@
+from collections.abc import Callable
+
 import bm25s
 import numpy as np
 import numpy.typing as npt
 
 from semble.index.dense import SelectableBasicBackend
 from semble.index.sparse import selector_to_mask
-from semble.ranking import apply_query_boost, boost_multi_chunk_files, rerank_topk, resolve_alpha
+from semble.ranking import apply_query_boost, boost_multi_chunk_files, diversify_results, rerank_topk, resolve_alpha
 from semble.tokens import tokenize
 from semble.types import Chunk, Encoder, SearchMode, SearchResult
+
+Reranker = Callable[[dict[Chunk, float], int], list[tuple[Chunk, float]]]
 
 _RRF_K = 60
 
@@ -26,15 +30,21 @@ def search_semantic(
     chunks: list[Chunk],
     top_k: int,
     selector: npt.NDArray[np.int_] | None,
+    diversity: float | None = None,
+    chunk_index: dict[Chunk, int] | None = None,
 ) -> list[SearchResult]:
     """Run semantic search for a query."""
+    fetch_k = top_k * 2 if diversity is not None and chunk_index is not None else top_k
     query_embedding = model.encode([query])
-    indices, scores = semantic_index.query(query_embedding, k=top_k, selector=selector)[0]
+    indices, scores = semantic_index.query(query_embedding, k=fetch_k, selector=selector)[0]
     # Vicinity returns cosine distance; convert to similarity so higher = better.
-    return [
+    results = [
         SearchResult(chunk=chunks[index], score=1.0 - float(distance), source=SearchMode.SEMANTIC)
         for index, distance in zip(indices, scores)
     ]
+    if diversity is not None and chunk_index is not None:
+        return diversify_results(results, top_k, diversity, semantic_index._vectors, chunk_index)
+    return results
 
 
 def _sort_top_k(arr: npt.NDArray, top_k: int) -> npt.NDArray[np.int_]:
@@ -76,6 +86,11 @@ def search_hybrid(
     top_k: int,
     alpha: float | None = None,
     selector: npt.NDArray[np.int_] | None = None,
+    reranker: Reranker | None = None,
+    semantic_filter: Reranker | None = None,
+    skip_file_boost: bool = False,
+    diversity: float | None = None,
+    chunk_index: dict[Chunk, int] | None = None,
 ) -> list[SearchResult]:
     """Hybrid search: alpha-weighted combination of semantic and BM25 scores.
 
@@ -90,6 +105,11 @@ def search_hybrid(
     :param top_k: Number of results to return.
     :param alpha: Weight for semantic score (1-alpha goes to BM25). None = auto-detect based on query type.
     :param selector: Optional array of chunk indices to filter results by.
+    :param reranker: Optional callable replacing the default rerank_topk step.
+    :param semantic_filter: Optional callable applied to semantic candidates before RRF fusion.
+    :param skip_file_boost: If True, skip the ``boost_multi_chunk_files`` step.
+    :param diversity: DPP diversity weight; when set, fetches 2× candidates and re-ranks with DPP.
+    :param chunk_index: Chunk-to-index mapping required when diversity is set.
     :return: List of search results sorted by combined score descending.
     """
     alpha_weight = resolve_alpha(query, alpha)
@@ -97,15 +117,18 @@ def search_hybrid(
     # Over-fetch candidates so the merged pool is large enough after union and re-ranking.
     candidate_count = top_k * 5
 
-    semantic = search_semantic(query, model, semantic_index, chunks, candidate_count, selector)
+    # When a semantic filter is provided, over-fetch so DPP has material to work with.
+    semantic_fetch_count = candidate_count * 2 if semantic_filter is not None else candidate_count
+    semantic = search_semantic(query, model, semantic_index, chunks, semantic_fetch_count, selector)
     semantic_scores: dict[Chunk, float] = {result.chunk: result.score for result in semantic}
-    bm25_scores = {}
-    for result in search_bm25(query, bm25_index, chunks, candidate_count, selector):
-        if result.score:
-            bm25_scores[result.chunk] = result.score
+
+    if semantic_filter is not None:
+        filtered = semantic_filter(semantic_scores, candidate_count)
+        semantic_scores = {chunk: score for chunk, score in filtered}
 
     normalized_semantic = _rrf_scores(semantic_scores)
-    normalized_bm25 = _rrf_scores(bm25_scores)
+    bm25_results = search_bm25(query, bm25_index, chunks, candidate_count, selector)
+    normalized_bm25 = _rrf_scores({r.chunk: r.score for r in bm25_results if r.score})
 
     # Sort by the file path and start line to
     # counteract randomness introduces by hashing.
@@ -120,9 +143,16 @@ def search_hybrid(
     }
 
     # Boost files with multiple relevant chunks.
-    boost_multi_chunk_files(combined_scores)
+    if not skip_file_boost:
+        boost_multi_chunk_files(combined_scores)
     # Boost queries with specific identifiers in them.
     combined_scores = apply_query_boost(combined_scores, query, chunks)
-    # Rerank the top-k results by applying path-based penalties.
-    ranked = rerank_topk(combined_scores, top_k, penalise_paths=alpha_weight < 1.0)
-    return [SearchResult(chunk=chunk, score=score, source=SearchMode.HYBRID) for chunk, score in ranked]
+    fetch_k = top_k * 2 if diversity is not None and chunk_index is not None else top_k
+    if reranker is not None:
+        ranked = reranker(combined_scores, fetch_k)
+    else:
+        ranked = rerank_topk(combined_scores, fetch_k, penalise_paths=alpha_weight < 1.0)
+    results = [SearchResult(chunk=chunk, score=score, source=SearchMode.HYBRID) for chunk, score in ranked]
+    if diversity is not None and chunk_index is not None:
+        return diversify_results(results, top_k, diversity, semantic_index._vectors, chunk_index)
+    return results
