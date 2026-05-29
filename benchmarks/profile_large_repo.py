@@ -86,6 +86,14 @@ def _instrument() -> None:
             return _orig_bm25_index(self, corpus, *args, **kwargs)
     bm25s.BM25.index = _timed_bm25_index  # type: ignore[method-assign]
 
+    # create_mod.tokenize — the list comp arg is evaluated before bm25s.BM25.index
+    # is called, so wrapping at the call site captures the true tokenization time.
+    _orig_tokenize = create_mod.tokenize
+    def _timed_tokenize(text):
+        with _timer("tokenize"):
+            return _orig_tokenize(text)
+    create_mod.tokenize = _timed_tokenize  # type: ignore[assignment]
+
 
 @dataclass
 class PhaseResult:
@@ -192,6 +200,7 @@ def run_profile(
         PhaseResult("walk_files", _sum_timing("walk_files")),
         PhaseResult("chunk_source (total)", _sum_timing("chunk_source")),
         PhaseResult("embed_chunks", _sum_timing("embed_chunks")),
+        PhaseResult("tokenize (BM25 prep)", _sum_timing("tokenize")),
         PhaseResult("bm25_index", _sum_timing("bm25_index")),
     ]
 
