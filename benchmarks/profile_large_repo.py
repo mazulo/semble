@@ -4,11 +4,12 @@ Usage:
     uv run python -m benchmarks.profile_large_repo /path/to/large/repo
     uv run python -m benchmarks.profile_large_repo /path/to/large/repo --queries "auth middleware" "database connection"
     uv run python -m benchmarks.profile_large_repo /path/to/large/repo --cprofile
+    uv run python -m benchmarks.profile_large_repo /path/to/large/repo --search-only
 
 Measures:
     - Cold index build (full pipeline breakdown)
     - Cache validation time (warm run)
-    - Query latency (p50/p90/p99)
+    - Query latency: first-query (cold encode), warm p50/p90/p99
 """
 
 from __future__ import annotations
@@ -22,8 +23,11 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 from unittest.mock import patch
+
+if TYPE_CHECKING:
+    from semble import SembleIndex
 
 import numpy as np
 
@@ -109,7 +113,8 @@ class ProfilingReport:
     cold_total_ms: float
     warm_total_ms: float
     cold_phases: list[PhaseResult] = field(default_factory=list)
-    query_latencies_ms: list[float] = field(default_factory=list)
+    first_query_ms: float | None = None       # cold: first query after loading index
+    query_latencies_ms: list[float] = field(default_factory=list)  # warm reps
 
     @property
     def p50_ms(self) -> float:
@@ -130,24 +135,27 @@ class ProfilingReport:
         print(f"  Chunks created: {self.chunk_count:,}")
         print(f"{'=' * 60}")
 
-        print(f"\n[COLD BUILD]  total: {self.cold_total_ms:,.0f}ms")
-        for phase in self.cold_phases:
-            pct = (phase.ms / self.cold_total_ms * 100) if self.cold_total_ms else 0
-            bar = "█" * int(pct / 2)
-            print(f"  {phase.label:<28} {phase.ms:>8,.0f}ms  {pct:5.1f}%  {bar}")
+        if self.cold_total_ms:
+            print(f"\n[COLD BUILD]  total: {self.cold_total_ms:,.0f}ms")
+            for phase in self.cold_phases:
+                pct = (phase.ms / self.cold_total_ms * 100) if self.cold_total_ms else 0
+                bar = "█" * int(pct / 2)
+                print(f"  {phase.label:<28} {phase.ms:>8,.0f}ms  {pct:5.1f}%  {bar}")
+            unaccounted = self.cold_total_ms - sum(p.ms for p in self.cold_phases)
+            if unaccounted > 0:
+                pct = unaccounted / self.cold_total_ms * 100
+                print(f"  {'(other)':<28} {unaccounted:>8,.0f}ms  {pct:5.1f}%")
 
-        unaccounted = self.cold_total_ms - sum(p.ms for p in self.cold_phases)
-        if unaccounted > 0:
-            pct = unaccounted / self.cold_total_ms * 100
-            print(f"  {'(other)':<28} {unaccounted:>8,.0f}ms  {pct:5.1f}%")
+        if self.warm_total_ms:
+            print(f"\n[WARM RUN]    total: {self.warm_total_ms:,.0f}ms  (cache hit)")
 
-        print(f"\n[WARM RUN]    total: {self.warm_total_ms:,.0f}ms  (cache hit)")
-
-        if self.query_latencies_ms:
-            print(f"\n[SEARCH] n={len(self.query_latencies_ms)} queries")
-            print(f"  p50: {self.p50_ms:.1f}ms")
-            print(f"  p90: {self.p90_ms:.1f}ms")
-            print(f"  p99: {self.p99_ms:.1f}ms")
+        if self.first_query_ms is not None or self.query_latencies_ms:
+            n_warm = len(self.query_latencies_ms)
+            print(f"\n[SEARCH]")
+            if self.first_query_ms is not None:
+                print(f"  first query (cold):  {self.first_query_ms:.1f}ms")
+            if self.query_latencies_ms:
+                print(f"  warm  n={n_warm:<6}  p50: {self.p50_ms:.1f}ms  p90: {self.p90_ms:.1f}ms  p99: {self.p99_ms:.1f}ms")
 
         print()
 
@@ -156,87 +164,118 @@ def _sum_timing(label: str) -> float:
     return sum(_timings.get(label, [0.0]))
 
 
+_DEFAULT_QUERIES = [
+    "authentication middleware",
+    "database connection pool",
+    "error handling",
+    "file read write",
+    "config parsing",
+    "cache invalidation",
+    "retry with backoff",
+    "parse command line arguments",
+    "logging setup",
+    "type checking",
+]
+
+
+def _bench_search(index: "SembleIndex", queries: list[str], top_k: int, reps: int) -> tuple[float, list[float]]:
+    """Run queries and return (first_query_ms, warm_latencies_ms).
+
+    The first invocation is treated as 'cold' (model encode path may be warm
+    but ANN index is freshly loaded). Subsequent reps are 'warm'.
+    """
+    all_queries = queries or _DEFAULT_QUERIES
+    first_ms: float | None = None
+    warm: list[float] = []
+
+    for i, query in enumerate(all_queries):
+        for rep in range(reps):
+            t0 = time.perf_counter()
+            index.search(query, top_k=top_k)
+            elapsed = (time.perf_counter() - t0) * 1000
+            if first_ms is None:
+                first_ms = elapsed
+            else:
+                warm.append(elapsed)
+
+    return first_ms or 0.0, warm
+
+
 def run_profile(
     repo_path: Path,
     queries: list[str],
     top_k: int,
     use_cprofile: bool,
+    search_only: bool,
+    reps: int,
 ) -> None:
     _instrument()
 
     from semble import SembleIndex
-    from semble.cache import clear_cache
+    from semble.cache import clear_cache, save_index_to_cache
 
     repo_str = str(repo_path)
 
-    # --- Cold build ---
-    print(f"Clearing cache for {repo_str}...", file=sys.stderr)
-    clear_cache(repo_str)
-    _timings.clear()
+    cold_ms = 0.0
+    warm_ms = 0.0
+    cold_phases: list[PhaseResult] = []
+    chunk_count = 0
+    file_count = 0
 
-    print("Cold build (no cache)...", file=sys.stderr)
-
-    if use_cprofile:
-        pr = cProfile.Profile()
-        pr.enable()
-
-    cold_start = time.perf_counter()
-    index = SembleIndex.from_path(repo_path)
-    cold_ms = (time.perf_counter() - cold_start) * 1000
-
-    if use_cprofile:
-        pr.disable()
-        buf = io.StringIO()
-        ps = pstats.Stats(pr, stream=buf).sort_stats("cumulative")
-        ps.print_stats(30)
-        print("\n[cProfile top 30 by cumulative time]")
-        print(buf.getvalue())
-
-    # Save index before cache to get warm timing
-    from semble.cache import save_index_to_cache
-    save_index_to_cache(index, repo_str)
-
-    cold_phases = [
-        PhaseResult("walk_files", _sum_timing("walk_files")),
-        PhaseResult("chunk_source (total)", _sum_timing("chunk_source")),
-        PhaseResult("embed_chunks", _sum_timing("embed_chunks")),
-        PhaseResult("tokenize (BM25 prep)", _sum_timing("tokenize")),
-        PhaseResult("bm25_index", _sum_timing("bm25_index")),
-    ]
-
-    chunk_count = len(index.chunks)
-    file_count = len(index.stats.languages) and index.stats.indexed_files
-
-    # --- Warm run (cache hit) ---
-    _timings.clear()
-    print("Warm run (from cache)...", file=sys.stderr)
-    warm_start = time.perf_counter()
-    index2 = SembleIndex.from_path(repo_path)
-    warm_ms = (time.perf_counter() - warm_start) * 1000
-
-    # --- Search queries ---
-    query_latencies: list[float] = []
-    if queries:
-        print(f"Running {len(queries)} queries x 5 reps...", file=sys.stderr)
-        for query in queries:
-            for _ in range(5):
-                t0 = time.perf_counter()
-                index2.search(query, top_k=top_k)
-                query_latencies.append((time.perf_counter() - t0) * 1000)
+    if search_only:
+        print("Search-only mode: loading from cache...", file=sys.stderr)
+        warm_start = time.perf_counter()
+        index2 = SembleIndex.from_path(repo_path)
+        warm_ms = (time.perf_counter() - warm_start) * 1000
+        chunk_count = len(index2.chunks)
+        file_count = index2.stats.indexed_files
     else:
-        default_queries = [
-            "authentication middleware",
-            "database connection pool",
-            "error handling",
-            "file read write",
-            "config parsing",
+        # --- Cold build ---
+        print(f"Clearing cache for {repo_str}...", file=sys.stderr)
+        clear_cache(repo_str)
+        _timings.clear()
+
+        print("Cold build (no cache)...", file=sys.stderr)
+
+        if use_cprofile:
+            pr = cProfile.Profile()
+            pr.enable()
+
+        cold_start = time.perf_counter()
+        index = SembleIndex.from_path(repo_path)
+        cold_ms = (time.perf_counter() - cold_start) * 1000
+
+        if use_cprofile:
+            pr.disable()
+            buf = io.StringIO()
+            ps = pstats.Stats(pr, stream=buf).sort_stats("cumulative")
+            ps.print_stats(30)
+            print("\n[cProfile top 30 by cumulative time]")
+            print(buf.getvalue())
+
+        save_index_to_cache(index, repo_str)
+
+        cold_phases = [
+            PhaseResult("walk_files", _sum_timing("walk_files")),
+            PhaseResult("chunk_source (total)", _sum_timing("chunk_source")),
+            PhaseResult("embed_chunks", _sum_timing("embed_chunks")),
+            PhaseResult("tokenize (BM25 prep)", _sum_timing("tokenize")),
+            PhaseResult("bm25_index", _sum_timing("bm25_index")),
         ]
-        print(f"Running {len(default_queries)} default queries x 5 reps...", file=sys.stderr)
-        for query in default_queries:
-            for _ in range(5):
-                t0 = time.perf_counter()
-                index2.search(query, top_k=top_k)
-                query_latencies.append((time.perf_counter() - t0) * 1000)
+
+        chunk_count = len(index.chunks)
+        file_count = index.stats.indexed_files
+
+        # --- Warm run (cache hit) ---
+        _timings.clear()
+        print("Warm run (from cache)...", file=sys.stderr)
+        warm_start = time.perf_counter()
+        index2 = SembleIndex.from_path(repo_path)
+        warm_ms = (time.perf_counter() - warm_start) * 1000
+
+    # --- Search ---
+    print(f"Running search benchmark ({reps} reps per query)...", file=sys.stderr)
+    first_query_ms, query_latencies = _bench_search(index2, queries, top_k, reps)
 
     report = ProfilingReport(
         repo_path=repo_str,
@@ -245,6 +284,7 @@ def run_profile(
         cold_total_ms=cold_ms,
         warm_total_ms=warm_ms,
         cold_phases=cold_phases,
+        first_query_ms=first_query_ms,
         query_latencies_ms=query_latencies,
     )
     report.print()
@@ -255,7 +295,9 @@ def main() -> None:
     parser.add_argument("repo", type=Path, help="Path to the repository to profile")
     parser.add_argument("--queries", nargs="*", default=[], help="Search queries to benchmark")
     parser.add_argument("--top-k", type=int, default=10, help="Number of results per query (default: 10)")
+    parser.add_argument("--reps", type=int, default=10, help="Warm repetitions per query (default: 10)")
     parser.add_argument("--cprofile", action="store_true", help="Also dump cProfile top-30 for cold build")
+    parser.add_argument("--search-only", action="store_true", help="Skip cold build, load from cache, bench search only")
     args = parser.parse_args()
 
     repo_path = args.repo.resolve()
@@ -268,6 +310,8 @@ def main() -> None:
         queries=args.queries,
         top_k=args.top_k,
         use_cprofile=args.cprofile,
+        search_only=args.search_only,
+        reps=args.reps,
     )
 
 
