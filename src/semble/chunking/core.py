@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cache
 from logging import getLogger
@@ -40,6 +42,22 @@ def _cached_get_parser(language: SupportedLanguage) -> Parser | None:
     except Exception:
         logger.error("Uncaught exception in _cached_get_parser", exc_info=True)
     return None
+
+
+def warm_parsers(languages: Iterable[str]) -> None:
+    """Pre-load tree-sitter parsers for all given languages in parallel.
+
+    get_parser releases the GIL (native C call), so threads provide true
+    parallelism here. Loading 39 parsers sequentially costs ~33s; in parallel
+    it costs ~max(single_parser_load_time) ≈ 1s.
+
+    :param languages: Language identifiers to pre-load (unknown languages are ignored).
+    """
+    unique = {lang for lang in languages if is_supported_language(lang)}
+    if not unique:
+        return
+    with ThreadPoolExecutor(max_workers=len(unique)) as executor:
+        list(executor.map(_cached_get_parser, unique))
 
 
 def _merge_adjacent_chunks(

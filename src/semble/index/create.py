@@ -7,6 +7,7 @@ from model2vec.model import StaticModel
 from vicinity.backends.basic import BasicArgs
 
 from semble.chunking import chunk_source
+from semble.chunking.core import warm_parsers
 from semble.index.dense import SelectableBasicBackend, embed_chunks
 from semble.index.file_walker import walk_files
 from semble.index.files import FileStatus, detect_language, get_extensions, get_file_status, read_file_text
@@ -30,15 +31,24 @@ def create_index_from_path(
     :raises ValueError: if no items were found, no index can be created.
     :return: A bm25 index, vicinity index and list of chunks
     """
-    chunks: list[Chunk] = []
     normalized = (content,) if isinstance(content, ContentType) else content
     resolved_extensions = get_extensions(normalized)
+
+    # Pass 1: collect valid files and detect languages.
+    file_entries: list[tuple[Path, str | None]] = []
     for file_path in walk_files(path, resolved_extensions):
         language = detect_language(file_path)
         with contextlib.suppress(OSError):
-            file_status = get_file_status(file_path, None)
-            if file_status != FileStatus.VALID:
-                continue
+            if get_file_status(file_path, None) == FileStatus.VALID:
+                file_entries.append((file_path, language))
+
+    # Pre-load all required tree-sitter parsers in parallel before chunking.
+    warm_parsers(lang for _, lang in file_entries if lang is not None)
+
+    # Pass 2: read and chunk files (parsers are now cached).
+    chunks: list[Chunk] = []
+    for file_path, language in file_entries:
+        with contextlib.suppress(OSError):
             source = read_file_text(file_path)
             chunk_path = file_path.relative_to(display_root) if display_root else file_path
             chunks.extend(chunk_source(source, str(chunk_path), language))

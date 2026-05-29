@@ -348,12 +348,37 @@ class SembleIndex:
             data = orjson.dumps(chunks_as_dict)
             f.write(data)
         root_str = None if self._root is None else str(self._root)
+        file_mtimes: dict[str, float] = {}
+        dir_mtimes: dict[str, float] = {}
+        if self._root is not None:
+            seen_dirs: set[Path] = set()
+            for rel_path in self._file_mapping:
+                abs_path = self._root / rel_path
+                try:
+                    file_mtimes[rel_path] = abs_path.stat().st_mtime
+                except OSError:
+                    pass
+                parent = abs_path.parent
+                while True:
+                    seen_dirs.add(parent)
+                    if parent == self._root:
+                        break
+                    parent = parent.parent
+            for dir_path in seen_dirs:
+                try:
+                    rel = "." if dir_path == self._root else str(dir_path.relative_to(self._root))
+                    dir_mtimes[rel] = dir_path.stat().st_mtime
+                except OSError:
+                    pass
+
         metadata = {
             "root_path": root_str,
             "time": datetime.now().timestamp(),
             "model_path": self._model_path,
             "content_type": list(x.value for x in self._content),
             "file_paths": sorted(self._file_mapping),
+            "file_mtimes": file_mtimes,
+            "dir_mtimes": dir_mtimes,
         }
         with open(persistence_paths.metadata, "wb") as f:
             data = orjson.dumps(metadata)

@@ -84,6 +84,37 @@ def _metadata_matches(metadata: dict, model_path: str, content: Sequence[Content
         return False
 
 
+def _fast_validate(root: Path, metadata: dict) -> bool:
+    """Validate cache using stored per-file and per-directory mtimes.
+
+    Checks stored file mtimes directly via stat — no directory walk needed.
+    Directory mtimes catch new or deleted files inside tracked directories.
+
+    :param root: Resolved repo root.
+    :param metadata: Loaded metadata dict, must contain ``file_mtimes``.
+    :return: True if the cache is still valid.
+    """
+    file_mtimes: dict[str, float] = metadata["file_mtimes"]
+    dir_mtimes: dict[str, float] = metadata.get("dir_mtimes", {})
+
+    for rel_path, expected_mtime in file_mtimes.items():
+        try:
+            if (root / rel_path).stat().st_mtime != expected_mtime:
+                return False
+        except OSError:
+            return False
+
+    for rel_dir, expected_dir_mtime in dir_mtimes.items():
+        dir_path = root if rel_dir == "." else root / rel_dir
+        try:
+            if dir_path.stat().st_mtime != expected_dir_mtime:
+                return False
+        except OSError:
+            return False
+
+    return True
+
+
 def get_validated_cache(path: str, model_path: str | None, content: Sequence[ContentType]) -> Path | None:
     """Validates the cache folder and returns the index path."""
     index_path = find_index_from_cache_folder(path)
@@ -104,10 +135,15 @@ def get_validated_cache(path: str, model_path: str | None, content: Sequence[Con
     if is_git_url(str(path)):
         return index_path
 
+    path_as_path = Path(path).resolve()
+
+    # Fast path: stored mtimes available (new cache format) — no directory walk.
+    if "file_mtimes" in metadata:
+        return index_path if _fast_validate(path_as_path, metadata) else None
+
+    # Legacy path: old cache without stored mtimes — fall back to full walk.
     write_time = metadata["time"]
     extensions = get_extensions(content)
-
-    path_as_path = Path(path).resolve()
     stored_files: list[str] = metadata.get("file_paths", [])
     current_files = []
     for file_path in walk_files(path_as_path, extensions=extensions):
