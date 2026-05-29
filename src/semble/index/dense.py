@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache
 from pathlib import Path
 
@@ -13,6 +16,9 @@ from vicinity.utils import normalize
 
 from semble.types import Chunk
 from semble.utils import resolve_model_name
+
+_EMBED_MIN_CHUNKS_FOR_PARALLEL = 2048
+_EMBED_MAX_WORKERS = min(os.cpu_count() or 1, 8)
 
 
 @cache
@@ -37,10 +43,30 @@ def load_model(model_path: str | None = None) -> tuple[StaticModel, str]:
 
 
 def embed_chunks(model: StaticModel, chunks: list[Chunk]) -> npt.NDArray[np.float32]:
-    """Embed chunks using the configured model."""
+    """Embed chunks using the configured model.
+
+    Splits work across threads when chunk count exceeds the parallel threshold.
+    Both the HuggingFace tokenizer (Rust) and the numpy pooling ops release the
+    GIL, so threads provide real parallelism on multi-core machines.
+    """
     if not chunks:
         return np.empty((0, model.dim), dtype=np.float32)
-    return np.array(model.encode([c.content for c in chunks], use_multiprocessing=False), dtype=np.float32)
+
+    texts = [c.content for c in chunks]
+
+    if len(chunks) < _EMBED_MIN_CHUNKS_FOR_PARALLEL or _EMBED_MAX_WORKERS <= 1:
+        return np.array(model.encode(texts, use_multiprocessing=False), dtype=np.float32)
+
+    batch_size = math.ceil(len(texts) / _EMBED_MAX_WORKERS)
+    batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+
+    def _encode(batch: list[str]) -> npt.NDArray[np.float32]:
+        return np.array(model.encode(batch, use_multiprocessing=False), dtype=np.float32)
+
+    with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+        results = list(executor.map(_encode, batches))
+
+    return np.concatenate(results, axis=0)
 
 
 class SelectableBasicBackend(CosineBasicBackend):
