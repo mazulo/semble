@@ -236,6 +236,15 @@ AGENTS: list[AgentTarget] = [
         instructions_path=None,
         subagent_path=_HOME / ".pi" / "agents" / "semble-search.md",
     ),
+    AgentTarget(
+        id="commandcode",
+        display_name="Command Code",
+        binary=None,
+        config_dir=_HOME / ".commandcode",
+        mcp=McpConfig(_HOME / ".commandcode" / "mcp.json", "mcpServers", _BARE_STDIO_SERVER_CONFIG),
+        instructions_path=_HOME / ".commandcode" / "AGENTS.md",
+        subagent_path=_HOME / ".commandcode" / "agents" / "semble-search.md",
+    ),
 ]
 
 
