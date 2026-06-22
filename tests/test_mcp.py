@@ -1,8 +1,8 @@
 import asyncio
 import threading
 from pathlib import Path
-from typing import Any, AsyncGenerator
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 from model2vec import StaticModel
@@ -26,7 +26,6 @@ async def _call_tool(
     index_method: str,
     index_return: list[SearchResult],
     index_chunks: list[Chunk] | None = None,
-    default_source: str | None = "/some/path",
 ) -> str:
     """Patch SembleIndex.from_path with a fake index and invoke the tool, returning the text."""
     fake_index = MagicMock()
@@ -34,7 +33,7 @@ async def _call_tool(
     if index_chunks is not None:
         fake_index.chunks = index_chunks
     with patch("semble.mcp.SembleIndex.from_path", return_value=fake_index):
-        server = create_server(cache, default_source=default_source)
+        server = create_server(cache)
         result = await server.call_tool(tool, args)
     return _tool_text(result)
 
@@ -180,21 +179,6 @@ async def test_index_cache_ignores_cache_save_failure(cache: _IndexCache, tmp_pa
 @pytest.mark.parametrize(
     ("tool", "args"),
     [
-        ("search", {"query": "foo"}),
-        ("find_related", {"file_path": "src/foo.py", "line": 10}),
-    ],
-)
-async def test_tool_no_repo_no_default(cache: _IndexCache, tool: str, args: dict[str, object]) -> None:
-    """Both tools return an error message when no repo and no default source are given."""
-    server = create_server(cache, default_source=None)
-    result = await server.call_tool(tool, args)
-    assert "No repo specified" in _tool_text(result)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("tool", "args"),
-    [
         ("search", {"query": "foo", "repo": "https://github.com/x/y"}),
         ("find_related", {"file_path": "src/foo.py", "line": 1, "repo": "https://github.com/x/y"}),
     ],
@@ -215,7 +199,7 @@ async def test_tool_index_failure(cache: _IndexCache, tool: str, args: dict[str,
     [
         pytest.param(
             "search",
-            {"query": "bar"},
+            {"query": "bar", "repo": "/some/path"},
             "search",
             [SearchResult(chunk=make_chunk("def bar(): pass", "src/bar.py"), score=0.9)],
             None,
@@ -224,7 +208,7 @@ async def test_tool_index_failure(cache: _IndexCache, tool: str, args: dict[str,
         ),
         pytest.param(
             "search",
-            {"query": "nothing"},
+            {"query": "nothing", "repo": "/some/path"},
             "search",
             [],
             None,
@@ -233,7 +217,7 @@ async def test_tool_index_failure(cache: _IndexCache, tool: str, args: dict[str,
         ),
         pytest.param(
             "find_related",
-            {"file_path": "src/foo.py", "line": 1},
+            {"file_path": "src/foo.py", "line": 1, "repo": "/some/path"},
             "find_related",
             [SearchResult(chunk=make_chunk("class Foo: pass", "src/foo.py"), score=0.8)],
             [make_chunk("class Foo: pass", "src/foo.py")],
@@ -242,7 +226,7 @@ async def test_tool_index_failure(cache: _IndexCache, tool: str, args: dict[str,
         ),
         pytest.param(
             "find_related",
-            {"file_path": "src/foo.py", "line": 1},
+            {"file_path": "src/foo.py", "line": 1, "repo": "/some/path"},
             "find_related",
             [],
             [make_chunk("class Foo: pass", "src/foo.py")],
@@ -251,7 +235,7 @@ async def test_tool_index_failure(cache: _IndexCache, tool: str, args: dict[str,
         ),
         pytest.param(
             "find_related",
-            {"file_path": "src/unknown.py", "line": 1},
+            {"file_path": "src/unknown.py", "line": 1, "repo": "/some/path"},
             "find_related",
             [],
             [],
@@ -277,21 +261,16 @@ async def test_tool_output(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("with_path", "load_err", "from_path_err", "stdio_yields"),
+    ("load_err", "stdio_yields"),
     [
-        (True, None, None, True),
-        (False, None, None, True),
-        (False, RuntimeError("boom"), None, True),
-        (True, None, RuntimeError("boom"), True),
-        (False, None, None, False),
+        (None, True),
+        (RuntimeError("boom"), True),
+        (None, False),
     ],
-    ids=["pre_index", "no_path", "model_load_fails", "prewarm_fails", "cancel_pending_init"],
+    ids=["model_loads", "model_load_fails", "cancel_pending_init"],
 )
 async def test_serve_runs_stdio(
-    tmp_path: Path,
-    with_path: bool,
     load_err: Exception | None,
-    from_path_err: Exception | None,
     stdio_yields: bool,
 ) -> None:
     """serve() runs stdio and handles all background init outcomes without raising."""
@@ -303,14 +282,11 @@ async def test_serve_runs_stdio(
     load_kwargs = (
         {"side_effect": load_err} if load_err else {"return_value": (MagicMock(spec=StaticModel), "/fake/model")}
     )
-    fp_kwargs = {"side_effect": from_path_err} if from_path_err else {"return_value": MagicMock()}
     with (
         patch("semble.mcp.load_model", **load_kwargs),
-        patch("semble.mcp.SembleIndex.from_path", **fp_kwargs),
-        patch.object(_IndexCache, "start_watcher", new_callable=AsyncMock),
         patch("mcp.server.fastmcp.FastMCP.run_stdio_async", side_effect=fake_stdio) as mock_run,
     ):
-        await (serve(str(tmp_path)) if with_path else serve())
+        await serve()
 
     mock_run.assert_called_once()
 
@@ -379,7 +355,7 @@ async def test_tool_rejects_unsafe_repo(
     cache: _IndexCache, repo: str, tool: str, extra_args: dict[str, object]
 ) -> None:
     """Both tools reject unsafe git transport schemes (ssh://, file://, SCP-form) supplied as repo."""
-    server = create_server(cache, default_source=None)
+    server = create_server(cache)
     result = await server.call_tool(tool, {**extra_args, "repo": repo})
     assert "Only https://" in _tool_text(result)
 
@@ -411,18 +387,3 @@ def test_cache_evict(cache: _IndexCache, tmp_path: Path) -> None:
 def test_cache_evict_missing(cache: _IndexCache, tmp_path: Path) -> None:
     """evict() on an unknown path is a no-op."""
     cache.evict(str(tmp_path))  # should not raise
-
-
-@pytest.mark.anyio
-async def test_watch_loop(cache: _IndexCache, tmp_path: Path) -> None:
-    """_watch_loop rebuilds on change (inner errors swallowed) and exits cleanly on watcher error."""
-
-    async def fake_awatch(_path: str) -> AsyncGenerator:
-        yield set()
-        raise RuntimeError("watcher died")
-
-    with patch("semble.mcp.watchfiles.awatch", fake_awatch):
-        with patch("semble.mcp.SembleIndex.from_path", side_effect=RuntimeError("build failed")):
-            await cache.start_watcher(str(tmp_path))
-            assert cache._watcher_task is not None
-            await cache._watcher_task
