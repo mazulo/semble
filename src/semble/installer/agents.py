@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +12,15 @@ _HOME = Path.home()
 
 Action = Literal["created", "updated", "unchanged", "not-found", "removed", "error", "skipped"]
 Mode = Literal["install", "uninstall"]
+
+
+class IntegrationType(str, Enum):
+    """Identifier for one of semble's install/uninstall integrations."""
+
+    MCP = "mcp"
+    INSTRUCTIONS = "instructions"
+    SUBAGENT = "subagent"
+
 
 SEMBLE_START = "<!-- SEMBLE_START -->"
 SEMBLE_END = "<!-- SEMBLE_END -->"

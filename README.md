@@ -57,6 +57,19 @@ uv cache clean semble    # for MCP users (restart your MCP client after)
 
 </details>
 
+<details>
+<summary>Unattended install</summary>
+
+For sandboxed or scripted environments, skip the prompts with `--agent` and, optionally, `--type`:
+
+```bash
+semble install --agent claude --type mcp subagent --yes
+```
+
+`--agent` accepts one or more agent ids (e.g. `claude`, `codex`, `pi`); `--type` accepts `mcp`, `instructions`, `subagent`, or `all` (default: all); `--yes` skips the confirmation prompt (requires `--agent` for a fully non-interactive run).
+
+</details>
+
 ## Main Features
 
 - **Fast**: indexes an average repo in ~250 ms and answers queries in ~1.5 ms, all on CPU.
