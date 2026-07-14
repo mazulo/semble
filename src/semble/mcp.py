@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import watchfiles
 from mcp.server.fastmcp import FastMCP
@@ -67,7 +66,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         query: Annotated[str, Field(description="Natural language or code query.")],
         repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
         top_k: Annotated[int, Field(description="Number of results to return.", ge=1)] = 5,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Search a codebase with a natural-language or code query.
 
         Pass a git URL or local path as `repo` to index it on demand; indexes are cached for the session.
@@ -76,11 +75,11 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         try:
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
-            return str(exc)
+            return {"error": str(exc)}
         results = index.search(query, top_k=top_k)
         if not results:
-            return json.dumps({"error": "No results found."})
-        return json.dumps(format_results(query, results))
+            return {"error": "No results found."}
+        return format_results(query, results)
 
     @server.tool()
     async def find_related(
@@ -91,7 +90,7 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         line: Annotated[int, Field(description="Line number (1-indexed).")],
         repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
         top_k: Annotated[int, Field(description="Number of similar chunks to return.", ge=1)] = 5,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Find code chunks semantically similar to a specific location in a file.
 
         Use after `search` to explore related implementations or callers.
@@ -100,17 +99,19 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         try:
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
-            return str(exc)
+            return {"error": str(exc)}
         chunk = resolve_chunk(index.chunks, file_path, line)
         if chunk is None:
-            return (
-                f"No chunk found at {file_path}:{line}. "
-                "Make sure the file is indexed and the line number is within a known chunk."
-            )
+            return {
+                "error": (
+                    f"No chunk found at {file_path}:{line}. "
+                    "Make sure the file is indexed and the line number is within a known chunk."
+                )
+            }
         results = index.find_related(chunk, top_k=top_k)
         if not results:
-            return json.dumps({"error": f"No related chunks found for {file_path}:{line}."})
-        return json.dumps(format_results(f"Chunks related to {file_path}:{line}", results))
+            return {"error": f"No related chunks found for {file_path}:{line}."}
+        return format_results(f"Chunks related to {file_path}:{line}", results)
 
     return server
 

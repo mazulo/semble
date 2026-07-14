@@ -18,6 +18,11 @@ def _tool_text(result: Any) -> str:
     return result[0][0].text
 
 
+def _tool_structured(result: Any) -> dict[str, Any]:
+    """Extract structuredContent from a FastMCP call_tool result."""
+    return result[1]
+
+
 async def _call_tool(
     cache: _IndexCache,
     tool: str,
@@ -27,16 +32,15 @@ async def _call_tool(
     index_return: list[SearchResult],
     index_chunks: list[Chunk] | None = None,
     default_source: str | None = "/some/path",
-) -> str:
-    """Patch SembleIndex.from_path with a fake index and invoke the tool, returning the text."""
+) -> Any:
+    """Patch SembleIndex.from_path with a fake index and invoke the tool."""
     fake_index = MagicMock()
     getattr(fake_index, index_method).return_value = index_return
     if index_chunks is not None:
         fake_index.chunks = index_chunks
     with patch("semble.mcp.SembleIndex.from_path", return_value=fake_index):
         server = create_server(cache, default_source=default_source)
-        result = await server.call_tool(tool, args)
-    return _tool_text(result)
+        return await server.call_tool(tool, args)
 
 
 @pytest.fixture()
@@ -255,9 +259,20 @@ async def test_tool_output(
     expected_substrings: list[str],
 ) -> None:
     """Search and find_related format results (or an empty-state message) through the server."""
-    text = await _call_tool(cache, tool, args, index_method=method, index_return=results, index_chunks=chunks)
+    result = await _call_tool(cache, tool, args, index_method=method, index_return=results, index_chunks=chunks)
+    text = _tool_text(result)
     for substring in expected_substrings:
         assert substring in text
+    structured = _tool_structured(result)
+    assert isinstance(structured, dict)
+    # Dict return must stay an object in structuredContent, never a pre-serialized JSON string.
+    assert not isinstance(structured.get("result"), str)
+    if results:
+        assert "query" in structured
+        assert isinstance(structured["results"], list)
+        assert "\\n" not in structured["results"][0]["chunk"]["content"]
+    else:
+        assert "error" in structured
 
 
 @pytest.mark.anyio
