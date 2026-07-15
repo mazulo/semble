@@ -14,7 +14,7 @@ from semble.cache import find_index_from_cache_folder
 from semble.index import SembleIndex
 from semble.stats import format_savings_report
 from semble.types import ContentType
-from semble.utils import format_results, is_git_url, resolve_chunk
+from semble.utils import format_results, format_results_human, is_git_url, resolve_chunk
 
 
 class Agent(str, Enum):
@@ -137,16 +137,25 @@ def _load_index(path: str, content: list[ContentType]) -> SembleIndex:
         sys.exit(1)
 
 
-def _run_search(path: str, query: str, top_k: int, content: list[ContentType]) -> None:
+def _run_search(path: str, query: str, top_k: int, content: list[ContentType], *, human: bool = False) -> None:
     """Handle the `search` subcommand."""
     index = _load_index(path, content)
     results = index.search(query, top_k=top_k)
-    out = format_results(query, results) if results else {"error": "No results found."}
-    print(json.dumps(out))
+    if not results:
+        if human:
+            print("No results found.")
+        else:
+            print(json.dumps({"error": "No results found."}))
+    elif human:
+        print(format_results_human(query, results))
+    else:
+        print(json.dumps(format_results(query, results)))
     _maybe_save_index(index, path)
 
 
-def _run_find_related(path: str, file_path: str, line: int, top_k: int, content: list[ContentType]) -> None:
+def _run_find_related(
+    path: str, file_path: str, line: int, top_k: int, content: list[ContentType], *, human: bool = False
+) -> None:
     """Handle the `find-related` subcommand."""
     index = _load_index(path, content)
     chunk = resolve_chunk(index.chunks, file_path, line)
@@ -154,13 +163,27 @@ def _run_find_related(path: str, file_path: str, line: int, top_k: int, content:
         print(f"No chunk found at {file_path}:{line}.", file=sys.stderr)
         sys.exit(1)
     results = index.find_related(chunk, top_k=top_k)
-    out = (
-        format_results(f"Chunks related to {file_path}:{line}", results)
-        if results
-        else {"error": f"No related chunks found for {file_path}:{line}."}
-    )
-    print(json.dumps(out))
+    label = f"Chunks related to {file_path}:{line}"
+    if not results:
+        err = f"No related chunks found for {file_path}:{line}."
+        if human:
+            print(err)
+        else:
+            print(json.dumps({"error": err}))
+    elif human:
+        print(format_results_human(label, results))
+    else:
+        print(json.dumps(format_results(label, results)))
     _maybe_save_index(index, path)
+
+
+def _add_output_args(p: argparse.ArgumentParser) -> None:
+    """Add --human output flag for interactive terminal reading."""
+    p.add_argument(
+        "--human",
+        action="store_true",
+        help="Print markdown for humans instead of JSON (default is JSON for agents).",
+    )
 
 
 def _cli_main() -> None:
@@ -172,6 +195,7 @@ def _cli_main() -> None:
     search_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
     search_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
     _add_content_args(search_p)
+    _add_output_args(search_p)
 
     related_p = sub.add_parser("find-related", help="Find code similar to a specific location.")
     related_p.add_argument("file_path", help="File path as shown in search results.")
@@ -179,6 +203,7 @@ def _cli_main() -> None:
     related_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
     related_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
     _add_content_args(related_p)
+    _add_output_args(related_p)
 
     init_p = sub.add_parser("init", help="Write a semble sub-agent file for your coding agent.")
     init_p.add_argument(
@@ -200,8 +225,19 @@ def _cli_main() -> None:
     elif args.command == "savings":
         print(format_savings_report(verbose=args.verbose))
     elif args.command == "search":
-        _run_search(args.path, args.query, args.top_k, _resolve_content(args.content, args.include_text_files))
+        _run_search(
+            args.path,
+            args.query,
+            args.top_k,
+            _resolve_content(args.content, args.include_text_files),
+            human=args.human,
+        )
     elif args.command == "find-related":
         _run_find_related(
-            args.path, args.file_path, args.line, args.top_k, _resolve_content(args.content, args.include_text_files)
+            args.path,
+            args.file_path,
+            args.line,
+            args.top_k,
+            _resolve_content(args.content, args.include_text_files),
+            human=args.human,
         )

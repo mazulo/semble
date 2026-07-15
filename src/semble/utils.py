@@ -37,6 +37,18 @@ def format_results(query: str, results: list[SearchResult]) -> dict[str, Any]:
     return {"query": query, "results": [r.to_dict() for r in results]}
 
 
+def format_results_human(header: str, results: list[SearchResult]) -> str:
+    """Render SearchResult objects as numbered markdown fenced code blocks."""
+    lines: list[str] = [header, ""]
+    for i, r in enumerate(results, 1):
+        lines.append(f"## {i}. {r.chunk.location}  [score={r.score:.3f}]")
+        lines.append("```")
+        lines.append(r.chunk.content.strip())
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def resolve_model_name() -> str:
     """Resolve a model name to a configurable."""
     return os.environ.get("SEMBLE_MODEL_NAME", DEFAULT_MODEL_NAME)

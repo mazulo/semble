@@ -33,6 +33,10 @@ def test_main_calls_asyncio_run(argv: list[str], monkeypatch: pytest.MonkeyPatch
     [
         (["semble", "search", "query text", "/some/path"], ["query text", "0.9"]),
         (["semble", "search", "nothing", "/some/path", "--top-k", "3"], ["No results found"]),
+        (
+            ["semble", "search", "query text", "/some/path", "--human"],
+            ["## 1. src/foo.py:1-1", "def foo(): pass", "score=0.900"],
+        ),
     ],
 )
 def test_cli_search(
@@ -52,6 +56,11 @@ def test_cli_search(
     out = capsys.readouterr().out
     for fragment in expected_in_output:
         assert fragment in out
+    if "--human" in argv:
+        assert '\\n' not in out
+        assert out.count("```") >= 2
+    else:
+        assert out.lstrip().startswith("{")
 
 
 @pytest.mark.parametrize(

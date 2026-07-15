@@ -9,7 +9,7 @@ from model2vec import StaticModel
 
 from semble.mcp import _CACHE_MAX_SIZE, _IndexCache, create_server, serve
 from semble.types import Chunk, SearchResult
-from semble.utils import format_results, is_git_url, resolve_chunk
+from semble.utils import format_results, format_results_human, is_git_url, resolve_chunk
 from tests.conftest import make_chunk
 
 
@@ -91,7 +91,7 @@ def test_is_git_url(path: str, expected: bool) -> None:
 
 
 def test_format_results() -> None:
-    """_format_results: empty list → header only; with results → numbered fenced blocks with scores."""
+    """format_results returns a JSONable dict with query, scores, and chunk content."""
     empty_out = format_results("query", [])
     assert empty_out == {"query": "query", "results": []}
 
@@ -105,6 +105,18 @@ def test_format_results() -> None:
         assert chunk.content in contents
     for score in [0.1, 0.2, 0.3]:
         assert score in scores
+
+
+def test_format_results_human() -> None:
+    """format_results_human renders numbered fenced blocks with scores."""
+    chunk = make_chunk('def foo():\n    return "hi"', "src/foo.py")
+    out = format_results_human("my query", [SearchResult(chunk=chunk, score=0.9)])
+    assert "my query" in out
+    assert "## 1. src/foo.py:1-2  [score=0.900]" in out
+    assert "def foo():" in out
+    assert 'return "hi"' in out
+    assert '\\n' not in out
+    assert '\\"' not in out
 
 
 @pytest.mark.anyio
