@@ -4,12 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0-fork)"
+        description: "Release tag (e.g. v0.3.1)"
         required: true
+      build_semble:
+        description: "Build and attach the semble (Python) package"
+        type: boolean
+        default: true
+      build_semble_core:
+        description: "Build and attach semble-core (Rust) wheels"
+        type: boolean
+        default: false
 
 jobs:
   build-semble:
     name: Build semble wheel
+    if: inputs.build_semble
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +36,7 @@ jobs:
 
   build-semble-core:
     name: Build semble-core (${{ matrix.os }} / ${{ matrix.target }})
+    if: inputs.build_semble_core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -57,6 +67,12 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [build-semble, build-semble-core]
+    if: >-
+      always()
+      && !cancelled()
+      && (needs.build-semble.result == 'success' || needs.build-semble.result == 'skipped')
+      && (needs.build-semble-core.result == 'success' || needs.build-semble-core.result == 'skipped')
+      && (needs.build-semble.result == 'success' || needs.build-semble-core.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
