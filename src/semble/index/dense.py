@@ -123,6 +123,18 @@ class SelectableBasicBackend(CosineBasicBackend):
 
     @classmethod
     def load(cls, path: Path) -> "SelectableBasicBackend":
-        """Load a selectable basic backend."""
+        """Load a selectable basic backend.
+
+        Materializes vectors into a contiguous float32 owned buffer and runs a
+        one-shot dummy query so the first real search after a cache hit does not
+        pay page-fault / OpenBLAS packing latency (can be 5–10× slower otherwise).
+        """
         loaded = super().load(path)
-        return SelectableBasicBackend(loaded.vectors, loaded.arguments)
+        # Force an owned contiguous copy. ascontiguousarray is a no-op when the
+        # loaded buffer is already C-contiguous, leaving a view that still pays
+        # first-touch / page-fault cost on the first real query.
+        vectors = np.array(loaded.vectors, dtype=np.float32, order="C", copy=True)
+        backend = SelectableBasicBackend(vectors, loaded.arguments)
+        if len(backend.vectors):
+            backend.query(backend.vectors[:1].copy(), k=1)
+        return backend

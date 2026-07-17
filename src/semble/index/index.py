@@ -322,6 +322,11 @@ class SembleIndex:
             root_path = Path(root_path)
 
         model, model_path = load_model(model_path)
+        # Prime encode + semantic query on the exact path used by search(), so the
+        # first user query after a cache hit does not pay one-shot GEMM/encoder cost.
+        warm_emb = np.asarray(model.encode(["warmup"]), dtype=np.float32)
+        if len(semantic_index.vectors):
+            semantic_index.query(warm_emb, k=min(50, len(semantic_index.vectors)))
 
         return cls(
             model,

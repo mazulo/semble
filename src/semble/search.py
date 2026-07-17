@@ -29,7 +29,9 @@ def _search_semantic(
     selector: npt.NDArray[np.int_] | None,
 ) -> list[SearchResult]:
     """Run semantic search for a query."""
-    query_embedding = model.encode([query])
+    # model2vec may return float16; store/query path is float32 — cast to avoid
+    # a slow first mixed-dtype GEMM after index load.
+    query_embedding = np.asarray(model.encode([query]), dtype=np.float32)
     indices, scores = semantic_index.query(query_embedding, k=top_k, selector=selector)[0]
     # Vicinity returns cosine distance; convert to similarity so higher = better.
     return [SearchResult(chunk=chunks[index], score=1.0 - float(distance)) for index, distance in zip(indices, scores)]
@@ -115,6 +117,9 @@ def search(
         + (1.0 - alpha_weight) * normalized_bm25.get(chunk, 0.0)
         for chunk in all_candidates
     }
+
+    # Drop zero-score candidates before rerank (matches upstream; less work).
+    combined_scores = {chunk: score for chunk, score in combined_scores.items() if score}
 
     if rerank:
         # Boost files with multiple relevant chunks.
