@@ -224,18 +224,21 @@ class SembleIndex:
                 content=normalized,
             )
 
-    def find_related(self, source: Chunk | SearchResult, *, top_k: int = 5) -> list[SearchResult]:
+    def find_related(
+        self, source: Chunk | SearchResult, *, top_k: int = 5, max_snippet_lines: int | None = None
+    ) -> list[SearchResult]:
         """Return chunks semantically similar to the given chunk or search result.
 
         :param source: A SearchResult or Chunk to use as the seed.
         :param top_k: Number of similar chunks to return.
+        :param max_snippet_lines: Lines of content to count for savings stats. None = full chunk.
         :return: Ranked list of SearchResult objects, most similar first.
         """
         target = source.chunk if isinstance(source, SearchResult) else source
         selector = self._get_selector_vector(filter_languages=[target.language]) if target.language else None
         results = _search_semantic(target.content, self.model, self._semantic_index, self.chunks, top_k + 1, selector)
         results = [r for r in results if r.chunk != target][:top_k]
-        save_search_stats(results, CallType.FIND_RELATED, self._file_sizes)
+        save_search_stats(results, CallType.FIND_RELATED, self._file_sizes, max_snippet_lines)
         return results
 
     def _get_selector_vector(
@@ -258,6 +261,7 @@ class SembleIndex:
         filter_languages: list[str] | None = None,
         filter_paths: list[str] | None = None,
         rerank: bool | None = None,
+        max_snippet_lines: int | None = None,
     ) -> list[SearchResult]:
         """Search the index and return the top-k most relevant chunks.
 
@@ -271,6 +275,7 @@ class SembleIndex:
             chunks from these files are returned.
         :param rerank: Apply code-tuned reranking (file boost, identifier boost, path penalties).
             Defaults to True when ContentType.CODE was indexed.
+        :param max_snippet_lines: Lines of content to count for savings stats. None = full chunk.
         :return: Ranked list of SearchResult objects, best match first.
         """
         if not self.chunks or not query.strip():
@@ -290,7 +295,7 @@ class SembleIndex:
             selector=selector,
             rerank=resolved_rerank,
         )
-        save_search_stats(results, CallType.SEARCH, self._file_sizes)
+        save_search_stats(results, CallType.SEARCH, self._file_sizes, max_snippet_lines)
         return results
 
     @classmethod
@@ -307,9 +312,9 @@ class SembleIndex:
 
         bm_25_index = BM25.load(persistence_paths.bm25_index)
         semantic_index = SelectableBasicBackend.load(persistence_paths.semantic_index)
-        with open(persistence_paths.metadata, "r") as f:
+        with open(persistence_paths.metadata, "rb") as f:
             metadata = orjson.loads(f.read())
-        with open(persistence_paths.chunks, "r") as f:
+        with open(persistence_paths.chunks, "rb") as f:
             chunk_data = orjson.loads(f.read())
 
         chunks = []
@@ -352,6 +357,8 @@ class SembleIndex:
         with open(persistence_paths.chunks, "wb") as f:
             data = orjson.dumps(chunks_as_dict)
             f.write(data)
+        from semble.chunking.chunking import _DESIRED_CHUNK_LENGTH_CHARS  # avoid circular import at module level
+
         root_str = None if self._root is None else str(self._root)
         file_mtimes: dict[str, float] = {}
         dir_mtimes: dict[str, float] = {}
@@ -382,6 +389,7 @@ class SembleIndex:
             "model_path": self._model_path,
             "content_type": list(x.value for x in self._content),
             "file_paths": sorted(self._file_mapping),
+            "chunk_size": _DESIRED_CHUNK_LENGTH_CHARS,
             "file_mtimes": file_mtimes,
             "dir_mtimes": dir_mtimes,
         }

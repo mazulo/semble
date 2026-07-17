@@ -118,7 +118,7 @@ def search(
         for chunk in all_candidates
     }
 
-    # Drop zero-score candidates before rerank (matches upstream; less work).
+    # Remove chunks that have 0.0 score
     combined_scores = {chunk: score for chunk, score in combined_scores.items() if score}
 
     if rerank:

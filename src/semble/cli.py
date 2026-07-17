@@ -1,33 +1,27 @@
 import argparse
 import asyncio
 import json
+import re
 import sys
 import warnings
-from enum import Enum
-from importlib.resources import files
 from importlib.util import find_spec
-from pathlib import Path
+from shutil import rmtree
+from typing import Literal
 
 from model2vec.utils import get_package_extras
 
-from semble.cache import find_index_from_cache_folder
+from semble.cache import find_index_from_cache_folder, resolve_cache_folder
 from semble.index import SembleIndex
+from semble.index.types import PersistencePath
+from semble.installer.agents import AGENTS, IntegrationType
 from semble.stats import format_savings_report
 from semble.types import ContentType
 from semble.utils import format_results, format_results_human, is_git_url, resolve_chunk
 
+_CLI_DISPATCH_ARGS = frozenset({"search", "find-related", "install", "uninstall", "savings", "-h", "--help", "clear"})
+_CLEAR_CHOICE = Literal["all", "index", "savings"]
 
-class Agent(str, Enum):
-    CLAUDE = "claude"
-    COPILOT = "copilot"
-    CURSOR = "cursor"
-    GEMINI = "gemini"
-    KIRO = "kiro"
-    OPENCODE = "opencode"
-
-
-_DEFAULT_AGENT = Agent.CLAUDE
-_CLI_DISPATCH_ARGS = frozenset({"search", "find-related", "init", "savings", "-h", "--help"})
+_SHA_256_REGEX = re.compile(r"^[a-f0-9]{64}$")
 
 
 def _build_index(path: str, content: list[ContentType]) -> SembleIndex:
@@ -47,12 +41,6 @@ def _maybe_save_index(index: SembleIndex, path: str) -> None:
             index.save(cache_folder)
         except Exception as e:
             print(f"Error saving index: {e}", file=sys.stderr)
-
-
-def _agent_path(agent: Agent) -> Path:
-    """Return the project-relative path where the semble sub-agent file should be written."""
-    base_dir = ".github" if agent is Agent.COPILOT else f".{agent.value}"
-    return Path(base_dir) / "agents" / "semble-search.md"
 
 
 def _add_content_args(p: argparse.ArgumentParser) -> None:
@@ -85,13 +73,6 @@ def _mcp_main() -> None:
         prog="semble",
         description="Instant local code search for agents.",
     )
-    parser.add_argument(
-        "path",
-        nargs="?",
-        default=None,
-        help="Local directory or git URL to pre-index at startup (optional).",
-    )
-    parser.add_argument("--ref", default=None, help="Branch or tag to check out (git URLs only).")
     _add_content_args(parser)
     args = parser.parse_args()
     if any(find_spec(dep) is None for dep in get_package_extras("semble", "mcp")):
@@ -100,19 +81,7 @@ def _mcp_main() -> None:
     from semble.mcp import serve
 
     content = _resolve_content(args.content, args.include_text_files)
-    asyncio.run(serve(args.path, ref=args.ref, content=content))
-
-
-def _run_init(*, agent: Agent = _DEFAULT_AGENT, force: bool = False) -> None:
-    """Write the semble sub-agent file for the given coding agent into the current project."""
-    dest = _agent_path(agent)
-    if dest.exists() and not force:
-        print(f"{dest} already exists. Run with --force to overwrite.", file=sys.stderr)
-        sys.exit(1)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    content = files("semble").joinpath(f"agents/{agent.value}.md").read_text(encoding="utf-8")
-    dest.write_text(content, encoding="utf-8")
-    print(f"Created {dest}")
+    asyncio.run(serve(content))
 
 
 def _resolve_content(content: list[str], include_text_files: bool) -> list[ContentType]:
@@ -137,10 +106,18 @@ def _load_index(path: str, content: list[ContentType]) -> SembleIndex:
         sys.exit(1)
 
 
-def _run_search(path: str, query: str, top_k: int, content: list[ContentType], *, human: bool = False) -> None:
+def _run_search(
+    path: str,
+    query: str,
+    top_k: int,
+    content: list[ContentType],
+    max_snippet_lines: int | None,
+    *,
+    human: bool = False,
+) -> None:
     """Handle the `search` subcommand."""
     index = _load_index(path, content)
-    results = index.search(query, top_k=top_k)
+    results = index.search(query, top_k=top_k, max_snippet_lines=max_snippet_lines)
     if not results:
         if human:
             print("No results found.")
@@ -149,12 +126,19 @@ def _run_search(path: str, query: str, top_k: int, content: list[ContentType], *
     elif human:
         print(format_results_human(query, results))
     else:
-        print(json.dumps(format_results(query, results)))
+        print(json.dumps(format_results(query, results, max_snippet_lines)))
     _maybe_save_index(index, path)
 
 
 def _run_find_related(
-    path: str, file_path: str, line: int, top_k: int, content: list[ContentType], *, human: bool = False
+    path: str,
+    file_path: str,
+    line: int,
+    top_k: int,
+    content: list[ContentType],
+    max_snippet_lines: int | None,
+    *,
+    human: bool = False,
 ) -> None:
     """Handle the `find-related` subcommand."""
     index = _load_index(path, content)
@@ -162,7 +146,7 @@ def _run_find_related(
     if chunk is None:
         print(f"No chunk found at {file_path}:{line}.", file=sys.stderr)
         sys.exit(1)
-    results = index.find_related(chunk, top_k=top_k)
+    results = index.find_related(chunk, top_k=top_k, max_snippet_lines=max_snippet_lines)
     label = f"Chunks related to {file_path}:{line}"
     if not results:
         err = f"No related chunks found for {file_path}:{line}."
@@ -173,7 +157,7 @@ def _run_find_related(
     elif human:
         print(format_results_human(label, results))
     else:
-        print(json.dumps(format_results(label, results)))
+        print(json.dumps(format_results(label, results, max_snippet_lines)))
     _maybe_save_index(index, path)
 
 
@@ -186,6 +170,35 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _run_clear(clear_type: _CLEAR_CHOICE) -> None:
+    """Run the `clear` subcommand."""
+    cache_folder = resolve_cache_folder()
+    if clear_type == "index" or clear_type == "all":
+        indexes = []
+        for path in cache_folder.glob("*/index"):
+            if not _SHA_256_REGEX.match(path.parent.name):
+                continue
+            if PersistencePath.from_path(path).non_existing():
+                continue
+            indexes.append(path)
+
+        if not indexes:
+            print(f"No indexes found to clear in `{cache_folder}`")
+        else:
+            for path in indexes:
+                index_folder = path.parent
+                rmtree(index_folder)
+                print(f"Cleared index at `{index_folder}`")
+
+    if clear_type == "savings" or clear_type == "all":
+        path = cache_folder / "savings.jsonl"
+        if not path.exists():
+            print(f"No savings file found at `{path}`")
+        else:
+            path.unlink()
+            print(f"Cleared savings at `{path}`")
+
+
 def _cli_main() -> None:
     parser = argparse.ArgumentParser(prog="semble")
     sub = parser.add_subparsers(dest="command")
@@ -194,42 +207,81 @@ def _cli_main() -> None:
     search_p.add_argument("query", help="Natural language or code query.")
     search_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
     search_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
+    search_p.add_argument(
+        "--max-snippet-lines",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Lines of source per result (default: full chunk). 10 = signature + body, 0 = no code.",
+    )
     _add_content_args(search_p)
     _add_output_args(search_p)
+
+    clear_p = sub.add_parser("clear", help="Clear the index cache.")
+    clear_p.add_argument("type", choices=["all", "index", "savings"], help="Type of cache to clear.")
 
     related_p = sub.add_parser("find-related", help="Find code similar to a specific location.")
     related_p.add_argument("file_path", help="File path as shown in search results.")
     related_p.add_argument("line", type=int, help="Line number (1-indexed).")
     related_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
     related_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
+    related_p.add_argument(
+        "--max-snippet-lines",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Lines of source per result (default: full chunk). 10 = signature + body, 0 = no code.",
+    )
     _add_content_args(related_p)
     _add_output_args(related_p)
 
-    init_p = sub.add_parser("init", help="Write a semble sub-agent file for your coding agent.")
-    init_p.add_argument(
-        "--agent",
-        "-a",
-        default=_DEFAULT_AGENT.value,
-        choices=[a.value for a in Agent],
-        help=f"Coding agent to set up (default: {_DEFAULT_AGENT.value}).",
-    )
-    init_p.add_argument("--force", action="store_true", help="Overwrite if the file already exists.")
+    sub.add_parser("savings", help="Show token savings and usage stats.")
 
-    savings_p = sub.add_parser("savings", help="Show token savings and usage stats.")
-    savings_p.add_argument("--verbose", action="store_true", help="Also show usage breakdown by call type.")
+    install_p = sub.add_parser("install", help="Configure semble across coding agents.")
+    uninstall_p = sub.add_parser("uninstall", help="Remove semble configuration from coding agents.")
+    for p, verb in ((install_p, "configure"), (uninstall_p, "remove configuration from")):
+        p.add_argument(
+            "--agent",
+            nargs="+",
+            choices=[a.id for a in AGENTS],
+            metavar="AGENT",
+            help=f"Agent(s) to {verb} non-interactively, e.g. --agent claude pi. Skips prompts.",
+        )
+        p.add_argument(
+            "--type",
+            nargs="+",
+            choices=[*(t.value for t in IntegrationType), "all"],
+            metavar="TYPE",
+            help="Integrations to include (mcp, instructions, subagent, or all). Default: all. Requires --agent.",
+        )
+        p.add_argument(
+            "-y",
+            "--yes",
+            action="store_true",
+            help="Skip the confirmation prompt. Combine with --agent for a fully non-interactive run.",
+        )
 
     args = parser.parse_args()
 
-    if args.command == "init":
-        _run_init(agent=Agent(args.agent), force=args.force)
-    elif args.command == "savings":
-        print(format_savings_report(verbose=args.verbose))
+    if args.command == "savings":
+        print(format_savings_report())
+    elif args.command in ("install", "uninstall"):
+        if args.type and not args.agent:
+            parser.error("--type requires --agent")
+
+        from semble.installer import run
+
+        integration_ids = None if not args.type or "all" in args.type else [IntegrationType(t) for t in args.type]
+        run(args.command, agent_ids=args.agent, integration_ids=integration_ids, yes=args.yes)
+    elif args.command == "clear":
+        _run_clear(args.type)
     elif args.command == "search":
         _run_search(
             args.path,
             args.query,
             args.top_k,
             _resolve_content(args.content, args.include_text_files),
+            args.max_snippet_lines,
             human=args.human,
         )
     elif args.command == "find-related":
@@ -239,5 +291,6 @@ def _cli_main() -> None:
             args.line,
             args.top_k,
             _resolve_content(args.content, args.include_text_files),
+            args.max_snippet_lines,
             human=args.human,
         )

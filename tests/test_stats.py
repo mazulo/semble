@@ -7,24 +7,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from semble.cli import _cli_main
-from semble.stats import build_savings_summary, format_savings_report, save_search_stats
+from semble.stats import _use_color, build_savings_summary, format_savings_report, save_search_stats
 from semble.types import CallType, SearchResult
 from tests.conftest import make_chunk
 
 
 def _make_stats_record(ts: float, call: str = "search", snippet_chars: int = 1_000, file_chars: int = 20_000) -> str:
     return json.dumps({"ts": ts, "call": call, "results": 3, "snippet_chars": snippet_chars, "file_chars": file_chars})
-
-
-@pytest.fixture
-def sample_stats_file(tmp_path: Path) -> Path:
-    """Stats file with one search and one find_related record from today."""
-    stats_file = tmp_path / "stats.jsonl"
-    now = datetime.now(timezone.utc).timestamp()
-    stats_file.write_text(
-        _make_stats_record(now, call="search") + "\n" + _make_stats_record(now, call="find_related") + "\n"
-    )
-    return stats_file
 
 
 def test_save_search_stats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,28 +37,27 @@ def test_savings_no_file(tmp_path: Path) -> None:
     assert "No stats yet" in format_savings_report(path=tmp_path / "nonexistent.jsonl")
 
 
+def test_no_color_disables_color_when_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NO_COLOR disables colors regardless of its value."""
+    monkeypatch.setenv("NO_COLOR", "")
+    with patch("semble.stats.sys.stdout.isatty", return_value=True):
+        assert not _use_color()
+
+
 @pytest.mark.parametrize(
-    ("verbose", "expected"),
+    ("file_chars", "expected"),
     [
-        (False, ["Savings", "Today"]),
-        (True, ["Savings", "Today", "Usage Breakdown", "search", "find_related"]),
+        (40_000, "~10.0k tokens"),
+        (4_000_000, "~1.0M tokens"),
     ],
-    ids=["default", "verbose"],
 )
-def test_savings_output(sample_stats_file: Path, verbose: bool, expected: list[str]) -> None:
-    """format_savings_report displays period buckets; --verbose adds call-type breakdown."""
-    result = format_savings_report(path=sample_stats_file, verbose=verbose)
-    for s in expected:
-        assert s in result
-
-
-def test_savings_output_millions(tmp_path: Path) -> None:
-    """Token counts >= 1M are formatted as M, not k."""
+def test_savings_output_token_suffixes(tmp_path: Path, file_chars: int, expected: str) -> None:
+    """Token counts use the expected suffix formatting."""
     stats_file = tmp_path / "stats.jsonl"
     stats_file.write_text(
-        _make_stats_record(datetime.now(timezone.utc).timestamp(), snippet_chars=0, file_chars=4_000_000) + "\n"
+        _make_stats_record(datetime.now(timezone.utc).timestamp(), snippet_chars=0, file_chars=file_chars) + "\n"
     )
-    assert "M tokens" in format_savings_report(path=stats_file)
+    assert expected in format_savings_report(path=stats_file)
 
 
 def test_savings_do_not_subtract_unknown_baselines(tmp_path: Path) -> None:
@@ -100,22 +88,14 @@ def test_savings_tolerates_bad_json(tmp_path: Path) -> None:
     assert "Savings" in format_savings_report(path=stats_file)
 
 
-@pytest.mark.parametrize(
-    ("argv", "expected"),
-    [
-        (["semble", "savings"], "No stats yet"),
-        (["semble", "savings", "--verbose"], "No stats yet"),
-    ],
-    ids=["default", "verbose"],
-)
 def test_savings_cli_dispatch(
-    argv: list[str], expected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Savings subcommand dispatches to format_savings_report, with and without --verbose."""
-    monkeypatch.setattr(sys, "argv", argv)
+    """Savings subcommand dispatches to format_savings_report."""
+    monkeypatch.setattr(sys, "argv", ["semble", "savings"])
     monkeypatch.setattr("semble.stats._get_stats_file", lambda: tmp_path / "nonexistent.jsonl")
     _cli_main()
-    assert expected in capsys.readouterr().out
+    assert "No stats yet" in capsys.readouterr().out
 
 
 def test_savings_buckets_exclude_old_records(tmp_path: Path) -> None:

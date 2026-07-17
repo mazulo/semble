@@ -1,21 +1,19 @@
 import sys
+import warnings
 from importlib.resources import files
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from semble.cli import Agent, _agent_path, _cli_main, _maybe_save_index, _run_init, main
+from semble.cli import _cli_main, _maybe_save_index, _run_clear, main
 from semble.types import ContentType, SearchResult
 from tests.conftest import make_chunk
-
-_CLAUDE_FILE_PATH = _agent_path(Agent.CLAUDE)
 
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["semble", "/some/path", "--ref", "main"],
         ["semble"],
     ],
 )
@@ -98,51 +96,6 @@ def test_cli_find_related(
         assert fragment in captured.out
     if expected_stderr:
         assert expected_stderr in captured.err
-
-
-@pytest.mark.parametrize("agent", list(Agent))
-def test_init_creates_file(
-    agent: Agent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """_run_init writes the correct agent file for every supported agent."""
-    monkeypatch.chdir(tmp_path)
-    _run_init(agent=agent)
-    dest = tmp_path / _agent_path(agent)
-    expected = files("semble").joinpath(f"agents/{agent.value}.md").read_text(encoding="utf-8")
-    assert dest.exists()
-    assert dest.read_text(encoding="utf-8") == expected
-    assert str(_agent_path(agent)) in capsys.readouterr().out
-
-
-def test_init_refuses_overwrite_without_force(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """_run_init exits with code 1 when the file exists and force=False."""
-    monkeypatch.chdir(tmp_path)
-    _run_init()
-    with pytest.raises(SystemExit) as exc_info:
-        _run_init()
-    assert exc_info.value.code == 1
-    assert "already exists" in capsys.readouterr().err
-
-
-def test_init_overwrites_with_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_run_init overwrites an existing file when force=True."""
-    monkeypatch.chdir(tmp_path)
-    dest = tmp_path / _CLAUDE_FILE_PATH
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text("old content", encoding="utf-8")
-    _run_init(force=True)
-    assert dest.read_text(encoding="utf-8") == files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8")
-
-
-def test_init_via_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """Semble init creates the Claude agent file via _cli_main."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["semble", "init"])
-    _cli_main()
-    assert (tmp_path / _CLAUDE_FILE_PATH).exists()
-    assert str(_CLAUDE_FILE_PATH) in capsys.readouterr().out
 
 
 def test_main_dispatches_to_cli(
@@ -228,8 +181,6 @@ def test_include_text_files_cli_deprecated(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """--include-text-files on CLI raises DeprecationWarning."""
-    import warnings
-
     chunk = make_chunk("def foo(): pass", "src/foo.py")
     fake_index = MagicMock()
     fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)]
@@ -285,3 +236,144 @@ def test_agent_file_tools_are_bash_only() -> None:
     tools = [t.strip() for t in tools_line.removeprefix("tools:").split(",")]
     assert set(tools) == {"Bash", "Read"}, f"Unexpected tools in agent file: {tools}"
     assert not any("mcp__" in t for t in tools)
+
+
+def _make_valid_index_dir(cache_folder: Path, sha: str = "a" * 64) -> Path:
+    """Create a fake valid index directory with the expected structure."""
+    index_dir = cache_folder / sha / "index"
+    index_dir.mkdir(parents=True)
+    # Create the files that PersistencePath.non_existing checks
+    (index_dir / "chunks.json").write_text("[]")
+    (index_dir / "bm25_index").write_text("")
+    (index_dir / "semantic_index").write_text("")
+    (index_dir / "metadata.json").write_text("{}")
+    return index_dir
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_in_output"),
+    [
+        ("valid", ["Cleared index", "a" * 64, "b" * 64]),
+        ("empty", ["No indexes found"]),
+        ("non_sha", ["No indexes found"]),
+        ("incomplete", ["No indexes found"]),
+    ],
+)
+def test_run_clear_index(
+    scenario: str, expected_in_output: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_run_clear('index') finds valid indexes, and skips non-SHA/incomplete/empty dirs."""
+    if scenario == "valid":
+        _make_valid_index_dir(tmp_path, "a" * 64)
+        _make_valid_index_dir(tmp_path, "b" * 64)
+    elif scenario == "non_sha":
+        bad_dir = tmp_path / "not-a-sha" / "index"
+        bad_dir.mkdir(parents=True)
+        (bad_dir / "chunks.json").write_text("[]")
+        (bad_dir / "bm25_index").write_text("")
+        (bad_dir / "semantic_index").write_text("")
+        (bad_dir / "metadata.json").write_text("{}")
+    elif scenario == "incomplete":
+        index_dir = tmp_path / ("c" * 64) / "index"
+        index_dir.mkdir(parents=True)
+
+    with patch("semble.cli.resolve_cache_folder", return_value=tmp_path):
+        _run_clear("index")
+
+    out = capsys.readouterr().out
+    for fragment in expected_in_output:
+        assert fragment in out
+
+    if scenario == "valid":
+        assert not (tmp_path / ("a" * 64)).exists()
+        assert not (tmp_path / ("b" * 64)).exists()
+
+
+@pytest.mark.parametrize(
+    ("create_file", "expected"),
+    [
+        (True, "Cleared savings"),
+        (False, "No savings file found"),
+    ],
+)
+def test_run_clear_savings(
+    create_file: bool, expected: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_run_clear('savings') deletes the file when present, reports missing otherwise."""
+    savings_file = tmp_path / "savings.jsonl"
+    if create_file:
+        savings_file.write_text('{"tokens": 100}\n')
+
+    with patch("semble.cli.resolve_cache_folder", return_value=tmp_path):
+        _run_clear("savings")
+
+    if create_file:
+        assert not savings_file.exists()
+    out = capsys.readouterr().out
+    assert expected in out
+
+
+@pytest.mark.parametrize(
+    ("populate", "expected_fragments"),
+    [
+        (True, ["Cleared index", "d" * 64, "Cleared savings"]),
+        (False, ["No indexes found", "No savings file found"]),
+    ],
+)
+def test_run_clear_all(
+    populate: bool, expected_fragments: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_run_clear('all') handles both indexes and savings."""
+    if populate:
+        _make_valid_index_dir(tmp_path, "d" * 64)
+        (tmp_path / "savings.jsonl").write_text('{"tokens": 50}\n')
+
+    with patch("semble.cli.resolve_cache_folder", return_value=tmp_path):
+        _run_clear("all")
+
+    out = capsys.readouterr().out
+    for fragment in expected_fragments:
+        assert fragment in out
+
+    if populate:
+        assert not (tmp_path / ("d" * 64)).exists()
+        assert not (tmp_path / "savings.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "setup_index", "setup_savings", "expected_fragments"),
+    [
+        ("index", True, False, ["Cleared index", "e" * 64]),
+        ("savings", False, True, ["Cleared savings"]),
+        ("all", True, True, ["Cleared index", "Cleared savings"]),
+    ],
+)
+def test_cli_clear_command(
+    subcommand: str,
+    setup_index: bool,
+    setup_savings: bool,
+    expected_fragments: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The `semble clear <subcommand>` CLI dispatches to _run_clear correctly."""
+    sha = "e" * 64
+    if setup_index:
+        _make_valid_index_dir(tmp_path, sha)
+    savings_file = tmp_path / "savings.jsonl"
+    if setup_savings:
+        savings_file.write_text('{"tokens": 200}\n')
+
+    monkeypatch.setattr(sys, "argv", ["semble", "clear", subcommand])
+    with patch("semble.cli.resolve_cache_folder", return_value=tmp_path):
+        _cli_main()
+
+    out = capsys.readouterr().out
+    for fragment in expected_fragments:
+        assert fragment in out
+
+    if setup_index:
+        assert not (tmp_path / sha).exists()
+    if setup_savings:
+        assert not savings_file.exists()

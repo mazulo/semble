@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -12,6 +13,8 @@ from semble.index.files import FileStatus, get_extensions, get_file_status
 from semble.index.types import PersistencePath
 from semble.types import ContentType
 from semble.utils import is_git_url, resolve_model_name
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from semble.index import SembleIndex
@@ -48,10 +51,25 @@ def _linux_cache_dir(name: str) -> Path:
     return base / name
 
 
+def _get_valid_user_cache_dir() -> Path | None:
+    """Gets the user cache dir if it is set and is a valid path."""
+    user_cache_location = os.getenv("SEMBLE_CACHE_LOCATION")
+    if user_cache_location is None:
+        return None
+    user_cache_dir = Path(user_cache_location)
+    if not user_cache_dir.is_absolute():
+        logger.warning("SEMBLE_CACHE_LOCATION is not an absolute path: %s", user_cache_location)
+        return None
+
+    return user_cache_dir
+
+
 def resolve_cache_folder() -> Path:
-    """Resolves a cache folder, respects XDG_CACHE_HOME."""
+    """Resolves a cache folder, respects SEMBLE_CACHE_LOCATION (highest precedence), XDG_CACHE_HOME."""
     name = "semble"
-    if sys.platform == "win32":
+    if user_cache_dir := _get_valid_user_cache_dir():
+        cache_dir = user_cache_dir
+    elif sys.platform == "win32":
         cache_dir = _windows_cache_dir(name)
     elif sys.platform == "darwin":
         cache_dir = _macos_cache_dir(name)
@@ -77,9 +95,14 @@ def save_index_to_cache(index: "SembleIndex", path: str) -> None:
 
 def _metadata_matches(metadata: dict, model_path: str, content: Sequence[ContentType]) -> bool:
     """Return True if the stored metadata is compatible with the requested parameters."""
+    from semble.chunking.chunking import _DESIRED_CHUNK_LENGTH_CHARS  # avoid circular import at module level
+
     try:
         content_type = tuple(ContentType(s) for s in metadata["content_type"])
-        return metadata["model_path"] == model_path and set(content_type) == set(content)
+        # chunk_size is absent in indexes built before this field was added; treat None as mismatch
+        # so old caches are transparently rebuilt with the current chunk size.
+        chunk_size_ok = metadata.get("chunk_size") == _DESIRED_CHUNK_LENGTH_CHARS
+        return metadata["model_path"] == model_path and set(content_type) == set(content) and chunk_size_ok
     except (KeyError, ValueError):
         return False
 
@@ -127,7 +150,7 @@ def get_validated_cache(path: str, model_path: str | None, content: Sequence[Con
 
     if model_path is None:
         model_path = resolve_model_name()
-    with open(persistence_path.metadata) as f:
+    with open(persistence_path.metadata, encoding="utf-8") as f:
         metadata = json.load(f)
     if not _metadata_matches(metadata, model_path, content):
         return None

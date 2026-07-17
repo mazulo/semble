@@ -33,13 +33,13 @@ dependencies = [
     "pathspec>=0.12",
     "tree-sitter>=0.25,<0.26",
     "tree-sitter-language-pack>=1.0,<1.8.0,!=1.6.3",
-    "orjson"
+    "orjson",
+    "questionary>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]
 mcp = [
     "mcp>=1.0,<2.0",
-    "watchfiles>=0.21",
 ]
 benchmark = [
     "sentence-transformers>=3.0",
@@ -75,7 +75,7 @@ where = ["src"]
 include = ["semble*"]
 
 [tool.setuptools.package-data]
-semble = ["py.typed", "agents/*.md"]
+semble = ["py.typed", "agents/*.md", "agents/*.toml"]
 
 [tool.setuptools_scm]
 # can be empty if no extra settings are needed, presence enables setuptools_scm
@@ -92,6 +92,7 @@ target-version = "py310"
 "tests/**" = ["ANN"]
 "benchmarks/*.py" = ["T20"]
 "src/semble/cli.py" = ["T20", "E501"]
+"src/semble/installer/*.py" = ["T20", "E501"]
 
 [tool.ruff.lint]
 select = [

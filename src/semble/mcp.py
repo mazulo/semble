@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
-import watchfiles
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from semble.cache import save_index_to_cache
+from semble.cache import get_validated_cache, save_index_to_cache
 from semble.index import SembleIndex
 from semble.index.dense import load_model
 from semble.types import ContentType
@@ -20,66 +20,74 @@ from semble.utils import format_results, is_git_url, resolve_chunk
 logger = logging.getLogger(__name__)
 
 _REPO_DESCRIPTION = (
-    "https:// or http:// git URL (e.g. https://github.com/org/repo) or local directory path to index and search. "
-    "Required when no default index was configured at startup. "
-    "The index is cached after the first call, so repeat queries are fast."
+    "A local directory path or https:// or http:// git URL (e.g. https://github.com/org/repo) to index and "
+    "search. The index is cached after the first call, so repeat queries are fast."
 )
 
 _CACHE_MAX_SIZE = 10  # Max number of cached indexes to keep in memory
+_MIN_REVALIDATE_FACTOR = 3  # Don't recheck staleness sooner than this many times the last build's duration
 
 
 async def _get_index(
-    repo: str | None,
-    default_source: str | None,
+    repo: str,
     cache: _IndexCache,
 ) -> SembleIndex:
     """Return a cached index for a repo, rejecting unsafe git transport schemes."""
-    if repo is not None and is_git_url(repo) and not repo.startswith(("https://", "http://")):
+    if is_git_url(repo) and not repo.startswith(("https://", "http://")):
         raise ValueError(f"Only https://, http://, or local directory paths are accepted as `repo`. Got: {repo!r}")
-    source = repo or default_source
-    if not source:
-        raise ValueError(
-            "No repo specified and no default index. "
-            "Pass an https:// or http:// git URL or local directory path as `repo`."
-        )
     try:
-        return await cache.get(source)
+        return await cache.get(repo)
     except Exception as exc:
-        raise ValueError(f"Failed to index {source!r}: {exc}") from exc
+        raise ValueError(f"Failed to index {repo!r}: {exc}") from exc
 
 
-def create_server(cache: _IndexCache, default_source: str | None = None) -> FastMCP:
+def create_server(cache: _IndexCache) -> FastMCP:
     """Build and return a configured FastMCP server backed by the given cache."""
     server = FastMCP(
         "semble",
         instructions=(
             "Instant code search for any local or remote git repository. "
-            "Call `search` to find relevant code; call `find_related` on a result to discover similar code elsewhere. "
+            "Call `search` once with a focused query, it returns the file path and exact line. "
+            "Navigate directly to that file at the given line; do not grep for the same content. "
+            "Use `find_related` to discover similar code elsewhere in the same repo. "
             "When working in a local project, pass the project root as `repo`. "
-            "For remote repos, pass an explicit https:// URL. Never guess or infer URLs. "
-            "Prefer these tools over Grep, Glob, or Read for any question about how code works."
+            "For remote repos, pass an explicit https:// URL. Never guess or infer URLs."
         ),
     )
 
     @server.tool()
     async def search(
         query: Annotated[str, Field(description="Natural language or code query.")],
-        repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
+        repo: Annotated[str, Field(description=_REPO_DESCRIPTION)],
         top_k: Annotated[int, Field(description="Number of results to return.", ge=1)] = 5,
+        max_snippet_lines: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Lines of source to include per result. "
+                    "Default (10): function/class signature + first body lines, enough to confirm the location. "
+                    "0: file path and line range only. None: full chunk (~10-20 lines). "
+                    "If the snippet does not contain enough context to confirm you have the right location, "
+                    "call again with max_snippet_lines=None."
+                ),
+                ge=0,
+            ),
+        ] = 10,
     ) -> dict[str, Any]:
-        """Search a codebase with a natural-language or code query.
+        """Search once with a focused query describing what the code does or its name.
 
-        Pass a git URL or local path as `repo` to index it on demand; indexes are cached for the session.
-        Use this to find where something is implemented, understand a library, or locate related code.
+        Write queries using function/class names or behavior descriptions, not error messages.
+        Returns file paths and line numbers — navigate directly there, do not repeat the search.
+        Pass a git URL or local path as `repo`; indexes are cached for the session.
         """
         try:
-            index = await _get_index(repo, default_source, cache)
+            index = await _get_index(repo, cache)
         except ValueError as exc:
             return {"error": str(exc)}
-        results = index.search(query, top_k=top_k)
+        results = index.search(query, top_k=top_k, max_snippet_lines=max_snippet_lines)
         if not results:
             return {"error": "No results found."}
-        return format_results(query, results)
+        return format_results(query, results, max_snippet_lines)
 
     @server.tool()
     async def find_related(
@@ -88,16 +96,27 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
             Field(description="Path to the file as stored in the index (use file_path from a search result)."),
         ],
         line: Annotated[int, Field(description="Line number (1-indexed).")],
-        repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
+        repo: Annotated[str, Field(description=_REPO_DESCRIPTION)],
         top_k: Annotated[int, Field(description="Number of similar chunks to return.", ge=1)] = 5,
+        max_snippet_lines: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Lines of source per result. "
+                    "Default 10 = signature + first body lines. 0 = location only. None = full chunk."
+                ),
+                ge=0,
+            ),
+        ] = 10,
     ) -> dict[str, Any]:
-        """Find code chunks semantically similar to a specific location in a file.
+        """Find code similar to a known location.
 
-        Use after `search` to explore related implementations or callers.
-        Pass file_path and line from a prior search result.
+        Useful for discovering all implementations of an interface, all callers of a function,
+        or all tests for a class. Use after `search` when you need related code beyond the primary result.
+        Pass `file_path` and `line` from a prior search result.
         """
         try:
-            index = await _get_index(repo, default_source, cache)
+            index = await _get_index(repo, cache)
         except ValueError as exc:
             return {"error": str(exc)}
         chunk = resolve_chunk(index.chunks, file_path, line)
@@ -108,24 +127,22 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
                     "Make sure the file is indexed and the line number is within a known chunk."
                 )
             }
-        results = index.find_related(chunk, top_k=top_k)
+        results = index.find_related(chunk, top_k=top_k, max_snippet_lines=max_snippet_lines)
         if not results:
             return {"error": f"No related chunks found for {file_path}:{line}."}
-        return format_results(f"Chunks related to {file_path}:{line}", results)
+        return format_results(f"Chunks related to {file_path}:{line}", results, max_snippet_lines)
 
     return server
 
 
 async def serve(
-    path: str | None = None,
-    ref: str | None = None,
     content: Sequence[ContentType] = (ContentType.CODE,),
 ) -> None:
-    """Start an MCP stdio server, optionally pre-indexing a default source."""
+    """Start an MCP stdio server."""
     cache = _IndexCache(content=content)
 
     async def _load_and_prewarm() -> None:
-        """Pre-load the model and optionally pre-index the default source in parallel with starting the server."""
+        """Pre-load the embedding model in parallel with starting the server."""
         try:
             _, cache._model_path = await asyncio.to_thread(load_model)
         except Exception as exc:
@@ -134,16 +151,9 @@ async def serve(
             return
         finally:
             cache._model_ready.set()
-        if path:
-            try:
-                await cache.get(path, ref=ref)
-            except Exception:
-                logger.warning("Failed to pre-index %r at startup", path, exc_info=True)
-            if not is_git_url(path):
-                await cache.start_watcher(path)
 
     init_task = asyncio.create_task(_load_and_prewarm())
-    server = create_server(cache, default_source=path)
+    server = create_server(cache)
     try:
         await server.run_stdio_async()
     finally:
@@ -161,7 +171,7 @@ class _IndexCache:
         self._model_ready = asyncio.Event()
         self._content = content
         self._tasks: OrderedDict[str, asyncio.Task[SembleIndex]] = OrderedDict()  # ordered for LRU eviction
-        self._watcher_task: asyncio.Task[None] | None = None
+        self._revalidate_after: dict[str, float] = {}  # cache_key -> monotonic time, staleness check is gated until
 
     async def _await_model(self) -> str:
         """Block until the model is installed; re-raise the load error if it failed."""
@@ -189,38 +199,63 @@ class _IndexCache:
             logger.warning("Failed to save index cache for %r", cache_key, exc_info=True)
         return index
 
+    async def _build_and_track(self, source: str, ref: str | None, model_path: str, cache_key: str) -> SembleIndex:
+        """Build an index and, for local paths, record when its staleness cooldown ends.
+
+        The cooldown write happens after the await, i.e. back on the event loop thread,
+        regardless of which thread `_build_and_cache_index` itself ran on.
+        """
+        start = time.monotonic()
+        index = await asyncio.to_thread(self._build_and_cache_index, source, ref, model_path, cache_key)
+        if not is_git_url(source):
+            finished = time.monotonic()
+            self._revalidate_after[cache_key] = finished + (finished - start) * _MIN_REVALIDATE_FACTOR
+        return index
+
     def evict(self, source: str) -> None:
-        self._tasks.pop(self._compute_cache_key(source), None)
+        cache_key = self._compute_cache_key(source)
+        self._tasks.pop(cache_key, None)
+        self._revalidate_after.pop(cache_key, None)
 
-    async def start_watcher(self, path: str) -> None:
-        """Start a background task that re-indexes the path whenever files change."""
-        self._watcher_task = asyncio.create_task(self._watch_loop(path))
+    async def _evict_if_stale(self, source: str, cache_key: str) -> None:
+        """Evict a cached local-path entry whose on-disk cache no longer matches its files.
 
-    async def _watch_loop(self, path: str) -> None:
-        """Watch the given path for changes and evict the cache entry on changes."""
-        try:
-            async for _ in watchfiles.awatch(path):
-                self.evict(path)
-                try:
-                    await self.get(path)
-                except Exception:
-                    logger.warning("Failed to rebuild index for %r after file change", path, exc_info=True)
-        except Exception:
-            pass
+        Skipped while inside the cooldown window so repos that are slow to build aren't
+        rebuilt faster than they can be served.
+        """
+        cached = self._tasks.get(cache_key)
+        if (
+            cached is None
+            or is_git_url(source)
+            or not cached.done()
+            or cached.cancelled()
+            or cached.exception() is not None
+        ):
+            return
+        if time.monotonic() < self._revalidate_after.get(cache_key, 0.0):
+            return
+        validated = await asyncio.to_thread(get_validated_cache, cache_key, self._model_path, self._content)
+        # Only evict if this entry hasn't already been replaced by a concurrent caller.
+        if validated is None and self._tasks.get(cache_key) is cached:
+            self.evict(source)
 
     async def get(self, source: str, ref: str | None = None) -> SembleIndex:
-        """Return an index for the requested source, building and caching it on first access."""
+        """Return an index for the requested source, building and caching it on first access.
+
+        Local paths are revalidated against the on-disk cache on every call (subject to a
+        cooldown scaled by build time), so an entry is rebuilt once its files change.
+        """
         cache_key = self._compute_cache_key(source, ref)
+        await self._evict_if_stale(source, cache_key)
 
         if cache_key not in self._tasks:
             model_path = await self._await_model()
             # Re-check after the await: another caller may have populated the entry.
             if cache_key not in self._tasks:
                 if len(self._tasks) >= _CACHE_MAX_SIZE:
-                    self._tasks.popitem(last=False)
-                self._tasks[cache_key] = asyncio.create_task(
-                    asyncio.to_thread(self._build_and_cache_index, source, ref, model_path, cache_key)
-                )
+                    evicted_key, _ = self._tasks.popitem(last=False)
+                    self._revalidate_after.pop(evicted_key, None)
+                self._tasks[cache_key] = asyncio.create_task(self._build_and_track(source, ref, model_path, cache_key))
         self._tasks.move_to_end(cache_key)
         task = self._tasks[cache_key]
         try:

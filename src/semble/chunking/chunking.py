@@ -6,8 +6,8 @@ from semble.types import Chunk
 logger = logging.getLogger(__name__)
 
 # The desired length of chunks in chars.
-# TODO: makes this configurable
-_DESIRED_CHUNK_LENGTH_CHARS = 1500
+# TODO: make this configurable
+_DESIRED_CHUNK_LENGTH_CHARS = 750
 
 
 def chunk_source(source: str, file_path: str, language: str | None) -> list[Chunk]:
